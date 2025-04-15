@@ -1,11 +1,12 @@
 # config.py
 
-d_model = 32
+d_model = 64
 num_heads = 2
 num_layers = 2
 resonant_token_count = 8
+dynamic_resonant_token_count = 8
 sequence_length = 384
-max_tokens = 1000000
+max_tokens = 2000000
 learning_rate = 1e-4
 batch_size = 64
 num_epochs = 100

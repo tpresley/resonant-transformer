@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from datasets import load_dataset
-from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss
+from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss  # updated to support hybrid static + dynamic resonance
+from sklearn.decomposition import PCA
 
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
@@ -17,7 +18,7 @@ elif torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-from config import d_model, num_heads, num_layers, resonant_token_count, sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs, lambda_ri, lambda_rs, lambda_div
+from config import d_model, num_heads, num_layers, resonant_token_count, dynamic_resonant_token_count, sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs, lambda_ri, lambda_rs, lambda_div
 
 # Initialize wandb
 wandb.init(project="resonant-transformer", config={
@@ -25,6 +26,7 @@ wandb.init(project="resonant-transformer", config={
     "num_heads": num_heads,
     "num_layers": num_layers,
     "resonant_token_count": resonant_token_count,
+    "dynamic_resonant_token_count": dynamic_resonant_token_count,
     "learning_rate": learning_rate,
     "batch_size": batch_size,
     "num_epochs": num_epochs,
@@ -85,8 +87,13 @@ if DYNAMIC_RESONANCE and MULTIHEAD_RESONANCE:
     MULTIHEAD_RESONANCE = False
 
 model = EnhancedResonantTransformer(
-    vocab_size, d_model, num_heads, num_layers, resonant_token_count,
-    dynamic=DYNAMIC_RESONANCE, multihead=MULTIHEAD_RESONANCE
+    vocab_size=vocab_size,
+    d_model=d_model,
+    num_heads=num_heads,
+    num_layers=num_layers,
+    resonant_token_count=resonant_token_count,
+    dynamic_resonant_token_count=dynamic_resonant_token_count,
+    multihead=False
 )
 model.to(DEVICE)
 model.alpha = 0.0  # Ensure full gradient flow through resonant tokens at start
@@ -201,12 +208,26 @@ for epoch in range(num_epochs):
                 token_metrics[f"rs_token_{i}_mean"] = rs_token_means[i].item()
                 token_metrics[f"rs_token_{i}_std"] = rs_token_stds[i].item()
 
-        influence_score = 100.0 * torch.sigmoid(2.0 * resonant_usage_reward.detach()).item() if res_tokens is not None and res_tokens.numel() > 0 else 0.0
+        if res_tokens is None or res_tokens.numel() == 0:
+            resonant_usage_reward = torch.tensor(0.0)
+        influence_score = resonant_usage_reward.item()
 
         if batch_idx % 10 == 0:
-            print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
             global_step = epoch * len(loader) + batch_idx
+            # === PCA logging for resonant token trajectories ===
+            if res_tokens is not None and res_tokens.numel() > 0:
+                flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
+                if flat_tokens.shape[0] >= 2:
+                    pca = PCA(n_components=2)
+                    projected = pca.fit_transform(flat_tokens)
+                    for i in range(min(res_tokens.size(1), 8)):
+                        wandb.log({
+                            f"res_token_{i}_pca_x": projected[i, 0],
+                            f"res_token_{i}_pca_y": projected[i, 1],
+                        }, step=global_step)
+            print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
             wandb.log({
+                "resonant_usage_reward": resonant_usage_reward.item(),
                 "loss": loss.item(),
                 "perplexity": np.exp(loss.item()),
                 "ri": ri.item(),
@@ -216,5 +237,21 @@ for epoch in range(num_epochs):
                 **token_metrics
             }, step=global_step)
 
-torch.save(model.state_dict(), "enhanced_resonant_model.pt")
-print("Model saved.")
+state = {
+    "model_state_dict": model.state_dict(),
+    "config": {
+        "vocab_size": vocab_size,
+        "sequence_length": sequence_length,
+        "d_model": d_model,
+        "num_heads": num_heads,
+        "num_layers": num_layers,
+        "resonant_token_count": resonant_token_count,
+        "dynamic_resonant_token_count": dynamic_resonant_token_count,
+        "multihead": MULTIHEAD_RESONANCE
+    },
+    "final_dynamic_resonant_state": last_resonant_state if last_resonant_state is not None else None
+}
+millions = int(max_tokens / 1_000_000)
+model_filename = f"{resonant_token_count}-{dynamic_resonant_token_count}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M.pt"
+torch.save(state, model_filename)
+print(f"Model saved to {model_filename} with config and final dynamic resonant state embedded.")

@@ -25,29 +25,36 @@ class ResonantController(nn.Module):
         self.d_model = d_model
 
     def forward(self, context_embedding):
+        if self.res_tokens == 0:
+            return torch.empty(context_embedding.size(0), 0, self.d_model, device=context_embedding.device)
+
         if context_embedding.dim() == 1:
             context_embedding = context_embedding.unsqueeze(0)
+
         out = self.linear(context_embedding).view(-1, self.res_tokens, self.d_model)
         out = F.layer_norm(out, (self.d_model,))
         return out
 
 class EnhancedResonantTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model, num_heads, num_layers, res_tokens, 
-                 dynamic=True, multihead=False):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers,
+                resonant_token_count=0, dynamic_resonant_token_count=0,
+                multihead=False):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.dynamic = dynamic
+        self.static_resonant_token_count = resonant_token_count
+        self.dynamic_resonant_token_count = dynamic_resonant_token_count
         self.multihead = multihead
-        self.res_tokens = res_tokens
         self.d_model = d_model
         self.alpha = 0.0
 
-        if self.dynamic:
-            self.controller = ResonantController(d_model, res_tokens)
-        elif self.multihead:
-            self.resonator = MultiHeadResonance(num_heads=4, res_tokens=res_tokens, d_model=d_model)
-        else:
-            self.resonant_tokens = nn.Parameter(torch.randn(1, res_tokens, d_model))
+        if self.dynamic_resonant_token_count > 0:
+            self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
+
+        if self.static_resonant_token_count > 0:
+            self.resonant_tokens = nn.Parameter(torch.randn(1, self.static_resonant_token_count, d_model))
+
+        if self.multihead:
+            self.resonator = MultiHeadResonance(num_heads=4, res_tokens=resonant_token_count, d_model=d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, dim_feedforward=512, dropout=0.1)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
@@ -57,34 +64,44 @@ class EnhancedResonantTransformer(nn.Module):
         x = self.embedding(x)
         B = x.size(0)
 
+        res_tokens = []
+
         if context is not None:
             context_vec = context.mean(dim=1) if context.dtype in (torch.float32, torch.float64) \
                           else self.embedding(context.long()).mean(dim=1)
 
-        if self.dynamic and context is not None and context.size(1) > 0:
-            context_vec = self.embedding(context.long()).mean(dim=1) if context.dtype in (torch.int, torch.long) else context.mean(dim=1)
-            res_tokens = self.controller(context_vec)
-        elif self.multihead and context is not None:
-            context_vec = context.float().mean(dim=1) if context.dim() == 3 else context
-            res_tokens = self.resonator(context_vec)
-        else:
-            if self.dynamic or self.multihead:
-                res_tokens = torch.zeros(B, 1, self.d_model, device=x.device)[:, :0, :]
+        if self.dynamic_resonant_token_count > 0 and context is not None and context.size(1) > 0:
+            dyn_tokens = self.controller(context_vec)
+            res_tokens.append(dyn_tokens)
+
+        if self.static_resonant_token_count > 0:
+            stat_tokens = self.resonant_tokens.repeat(B, 1, 1)
+            res_tokens.append(stat_tokens)
+
+        if res_tokens:
+            if res_tokens:
+                batch_size = x.size(0)
+                for i in range(len(res_tokens)):
+                    if res_tokens[i].size(0) == 1 and batch_size != 1:
+                        res_tokens[i] = res_tokens[i].expand(batch_size, -1, -1)
+                    elif res_tokens[i].size(0) != batch_size:
+                        raise ValueError(f"Resonant token tensor batch mismatch: got {res_tokens[i].size(0)}, expected {batch_size}")
+                res_tokens = torch.cat(res_tokens, dim=1)
             else:
-                res_tokens = self.resonant_tokens.repeat(B, 1, 1)
+                res_tokens = torch.empty(B, 0, self.d_model, device=x.device)
+        else:
+            res_tokens = torch.empty(B, 0, self.d_model, device=x.device)
 
-
-        if self.training and self.res_tokens > 0 and res_tokens.numel() > 0 and res_tokens.requires_grad:
+        if self.training and res_tokens.numel() > 0 and res_tokens.requires_grad:
             res_tokens.retain_grad()
             self._res_tokens_for_ri = res_tokens
 
-        if self.res_tokens > 0:
+        if res_tokens.size(1) > 0:
             x = torch.cat([amplify_grad(res_tokens, self.alpha), x], dim=1)
 
         x = x.transpose(0, 1)
         encoded = self.encoder(x)
-        res_len = res_tokens.shape[1] if res_tokens is not None else 0
-        out = encoded[res_len:].transpose(0, 1)
+        out = encoded[res_tokens.size(1):].transpose(0, 1)
         return self.output(out), res_tokens
 
 def amplify_grad(x, alpha):
