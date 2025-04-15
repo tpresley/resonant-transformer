@@ -25,6 +25,8 @@ class ResonantController(nn.Module):
         self.d_model = d_model
 
     def forward(self, context_embedding):
+        if context_embedding.dim() == 1:
+            context_embedding = context_embedding.unsqueeze(0)
         out = self.linear(context_embedding).view(-1, self.res_tokens, self.d_model)
         out = F.layer_norm(out, (self.d_model,))
         return out
@@ -59,12 +61,18 @@ class EnhancedResonantTransformer(nn.Module):
             context_vec = context.mean(dim=1) if context.dtype in (torch.float32, torch.float64) \
                           else self.embedding(context.long()).mean(dim=1)
 
-        if self.dynamic and context is not None:
+        if self.dynamic and context is not None and context.size(1) > 0:
+            context_vec = self.embedding(context.long()).mean(dim=1) if context.dtype in (torch.int, torch.long) else context.mean(dim=1)
             res_tokens = self.controller(context_vec)
         elif self.multihead and context is not None:
+            context_vec = context.float().mean(dim=1) if context.dim() == 3 else context
             res_tokens = self.resonator(context_vec)
         else:
-            res_tokens = self.resonant_tokens.repeat(B, 1, 1) if self.res_tokens > 0 else torch.empty(B, 0, self.d_model, device=x.device)
+            if self.dynamic or self.multihead:
+                res_tokens = torch.zeros(B, 1, self.d_model, device=x.device)[:, :0, :]
+            else:
+                res_tokens = self.resonant_tokens.repeat(B, 1, 1)
+
 
         if self.training and self.res_tokens > 0 and res_tokens.numel() > 0 and res_tokens.requires_grad:
             res_tokens.retain_grad()
@@ -75,7 +83,8 @@ class EnhancedResonantTransformer(nn.Module):
 
         x = x.transpose(0, 1)
         encoded = self.encoder(x)
-        out = encoded[self.res_tokens:].transpose(0, 1)
+        res_len = res_tokens.shape[1] if res_tokens is not None else 0
+        out = encoded[res_len:].transpose(0, 1)
         return self.output(out), res_tokens
 
 def amplify_grad(x, alpha):

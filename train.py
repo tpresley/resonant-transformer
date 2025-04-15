@@ -10,7 +10,12 @@ from tokenizers.processors import BertProcessing
 from datasets import load_dataset
 from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
 
 from config import d_model, num_heads, num_layers, resonant_token_count, sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs, lambda_ri, lambda_rs, lambda_div
 
@@ -108,10 +113,16 @@ for epoch in range(num_epochs):
         output, res_tokens = model(input_seq, context=context_input)
         res_tokens_for_grad = getattr(model, "_res_tokens_for_ri", None)
 
-        output = output[:, :target_seq.shape[1]]
-        loss = criterion(output.reshape(-1, vocab_size), target_seq.reshape(-1))
+        output = output[:, :input_seq.shape[1]]
+        output = torch.clamp(output, min=-10.0, max=10.0)
+        output_flat = output.reshape(-1, vocab_size)
+        target_flat = target_seq.reshape(-1)
+        loss = criterion(output_flat, target_flat)
+        if not torch.isfinite(loss):
+            raise ValueError("NaN or Inf detected in main loss")
 
         if res_tokens is not None and res_tokens.numel() > 0 and res_tokens_for_grad is not None:
+            last_resonant_state = res_tokens_for_grad.detach()
             if model.training:
                 dropout_mask = torch.rand(res_tokens.size(1), device=res_tokens.device) > 0.1
                 res_tokens = res_tokens[:, dropout_mask, :]
@@ -133,6 +144,34 @@ for epoch in range(num_epochs):
                 rs = rs_per_token.mean()
 
             loss = loss - lambda_ri * ri - lambda_rs * rs
+
+            # === Participation Reward: Compare model with vs. without resonant tokens ===
+            target_seq = batch[:, 1:]
+            target_flat = target_seq.reshape(-1)
+            with torch.no_grad():
+                empty_context = torch.empty(input_seq.size(0), 0, model.d_model, device=input_seq.device)
+                output_nores, _ = model(input_seq, context=empty_context)
+                output_nores = output_nores[:, :input_seq.shape[1]]
+                output_nores = torch.clamp(output_nores, min=-10.0, max=10.0)
+                output_nores_flat = output_nores.reshape(-1, vocab_size)
+                target_flat = target_seq.reshape(-1)
+                loss_nores = criterion(output_nores_flat, target_flat)
+                if not torch.isfinite(loss_nores):
+                    raise ValueError("NaN or Inf detected in loss_nores")
+
+                output_with_res, _ = model(input_seq, context=context_input)
+                output_with_res = output_with_res[:, :input_seq.shape[1]]
+                output_with_res = torch.clamp(output_with_res, min=-10.0, max=10.0)
+                output_with_res_flat = output_with_res.reshape(-1, vocab_size)
+                loss_with_res = criterion(output_with_res_flat, target_flat)
+                if not torch.isfinite(loss_with_res):
+                    raise ValueError("NaN or Inf detected in loss_with_res")
+
+            resonant_usage_reward = loss_nores - loss_with_res
+            resonant_usage_reward = torch.clamp(resonant_usage_reward, -10.0, 10.0)
+            lambda_participation = 0.1  # Tune this weight
+            loss -= lambda_participation * resonant_usage_reward
+            # NOTE: This doubles forward-pass cost. In future, consider gating this every N batches.
 
         if USE_CONTRASTIVE_LOSS:
             contrast_input = input_seq.clone()
@@ -162,23 +201,20 @@ for epoch in range(num_epochs):
                 token_metrics[f"rs_token_{i}_mean"] = rs_token_means[i].item()
                 token_metrics[f"rs_token_{i}_std"] = rs_token_stds[i].item()
 
-        influence_score = min(100.0, 50.0 * (ri.item() + (2.0 - rs.item()))) if res_tokens is not None and res_tokens.numel() > 0 else 0.0
+        influence_score = 100.0 * torch.sigmoid(2.0 * resonant_usage_reward.detach()).item() if res_tokens is not None and res_tokens.numel() > 0 else 0.0
 
         if batch_idx % 10 == 0:
             print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
+            global_step = epoch * len(loader) + batch_idx
             wandb.log({
                 "loss": loss.item(),
                 "perplexity": np.exp(loss.item()),
                 "ri": ri.item(),
                 "rs": rs.item(),
-                "epoch": epoch,
-                "batch": batch_idx,
                 "resonant_tokens_active": dropout_mask.sum().item() if res_tokens is not None and 'dropout_mask' in locals() else 0,
                 "resonant_influence_score": influence_score,
                 **token_metrics
-            })
-
-    print(f"Epoch {epoch+1} | Loss: {total_loss / len(loader):.4f}")
+            }, step=global_step)
 
 torch.save(model.state_dict(), "enhanced_resonant_model.pt")
 print("Model saved.")
