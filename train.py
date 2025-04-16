@@ -10,6 +10,7 @@ from tokenizers.processors import BertProcessing
 from datasets import load_dataset
 from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss  # updated to support hybrid static + dynamic resonance
 from sklearn.decomposition import PCA
+from collections import deque
 
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
@@ -36,6 +37,9 @@ wandb.init(project="resonant-transformer", config={
     "lambda_rs": lambda_rs,
     "lambda_div": lambda_div
 })
+
+# Table buffer for PCA
+pca_data_buffer = deque(maxlen=100 * batch_size)
 
 # Load TinyStories
 dataset = load_dataset("roneneldan/TinyStories", split="train")
@@ -216,29 +220,24 @@ for epoch in range(num_epochs):
 
         if batch_idx % 10 == 0:
             global_step = epoch * len(loader) + batch_idx
-            # === PCA logging for resonant token trajectories ===
             if res_tokens is not None and res_tokens.numel() > 0:
-                if res_tokens is not None and res_tokens.numel() > 0:
-                    # Flatten across batch dimension
-                    token_count = res_tokens.size(1)
-                    flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
-                    if flat_tokens.shape[0] >= 2:
-                        pca = PCA(n_components=2)
-                        projected = pca.fit_transform(flat_tokens)
-                        num_batches = res_tokens.size(0)
-                        # Repeat token indices for each batch row
-                        token_indices = np.tile(np.arange(token_count), num_batches)
+                token_count = res_tokens.size(1)
+                flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
+                if flat_tokens.shape[0] >= 2:
+                    pca = PCA(n_components=2)
+                    projected = pca.fit_transform(flat_tokens)
+                    num_batches = res_tokens.size(0)
+                    token_indices = np.tile(np.arange(token_count), num_batches)
+                    for (x, y), label in zip(projected.tolist(), token_indices):
+                        pca_data_buffer.append([float(x), float(y), int(label), global_step])
+                    table = wandb.Table(columns=["x", "y", "label", "step"])
+                    for row in pca_data_buffer:
+                        table.add_data(*row)
+                    wandb.log({
+                        "resonant_tokens_pca": wandb.plot.scatter(
+                            table, x="x", y="y", title="Resonant Tokens PCA")
+                    }, step=global_step)
 
-                        data = [[float(x), float(y), int(label)] for (x, y), label in zip(projected.tolist(), token_indices)]
-                        table = wandb.Table(data=data, columns=["x", "y", "label"])
-                        wandb.log({
-                            "resonant_tokens_pca": wandb.plot.scatter(
-                                table,
-                                x="x",
-                                y="y",
-                                title="Resonant Tokens PCA"
-                            )
-                        }, step=global_step)
             print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
             wandb.log({
                 "resonant_usage_reward": resonant_usage_reward.item(),
