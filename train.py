@@ -153,32 +153,34 @@ for epoch in range(num_epochs):
             loss = loss - lambda_ri * ri - lambda_rs * rs
 
             # === Participation Reward: Compare model with vs. without resonant tokens ===
-            target_seq = batch[:, 1:]
-            target_flat = target_seq.reshape(-1)
-            with torch.no_grad():
-                empty_context = torch.empty(input_seq.size(0), 0, model.d_model, device=input_seq.device)
-                output_nores, _ = model(input_seq, context=empty_context)
-                output_nores = output_nores[:, :input_seq.shape[1]]
-                output_nores = torch.clamp(output_nores, min=-10.0, max=10.0)
-                output_nores_flat = output_nores.reshape(-1, vocab_size)
+            run_every_x_batches = 1
+            if batch_idx % run_every_x_batches == 0:
+                target_seq = batch[:, 1:]
                 target_flat = target_seq.reshape(-1)
-                loss_nores = criterion(output_nores_flat, target_flat)
-                if not torch.isfinite(loss_nores):
-                    raise ValueError("NaN or Inf detected in loss_nores")
+                with torch.no_grad():
+                    empty_context = torch.empty(input_seq.size(0), 0, model.d_model, device=input_seq.device)
+                    output_nores, _ = model(input_seq, context=empty_context)
+                    output_nores = output_nores[:, :input_seq.shape[1]]
+                    output_nores = torch.clamp(output_nores, min=-10.0, max=10.0)
+                    output_nores_flat = output_nores.reshape(-1, vocab_size)
+                    target_flat = target_seq.reshape(-1)
+                    loss_nores = criterion(output_nores_flat, target_flat)
+                    if not torch.isfinite(loss_nores):
+                        raise ValueError("NaN or Inf detected in loss_nores")
 
-                output_with_res, _ = model(input_seq, context=context_input)
-                output_with_res = output_with_res[:, :input_seq.shape[1]]
-                output_with_res = torch.clamp(output_with_res, min=-10.0, max=10.0)
-                output_with_res_flat = output_with_res.reshape(-1, vocab_size)
-                loss_with_res = criterion(output_with_res_flat, target_flat)
-                if not torch.isfinite(loss_with_res):
-                    raise ValueError("NaN or Inf detected in loss_with_res")
+                    output_with_res, _ = model(input_seq, context=context_input)
+                    output_with_res = output_with_res[:, :input_seq.shape[1]]
+                    output_with_res = torch.clamp(output_with_res, min=-10.0, max=10.0)
+                    output_with_res_flat = output_with_res.reshape(-1, vocab_size)
+                    loss_with_res = criterion(output_with_res_flat, target_flat)
+                    if not torch.isfinite(loss_with_res):
+                        raise ValueError("NaN or Inf detected in loss_with_res")
 
-            resonant_usage_reward = loss_nores - loss_with_res
-            resonant_usage_reward = torch.clamp(resonant_usage_reward, -10.0, 10.0)
-            lambda_participation = 0.1  # Tune this weight
-            loss -= lambda_participation * resonant_usage_reward
-            # NOTE: This doubles forward-pass cost. In future, consider gating this every N batches.
+                resonant_usage_reward = loss_nores - loss_with_res
+                resonant_usage_reward = torch.clamp(resonant_usage_reward, -10.0, 10.0)
+                lambda_participation = 0.1  # Tune this weight
+                loss -= lambda_participation * resonant_usage_reward
+                # NOTE: This doubles forward-pass cost. In future, consider gating this every N batches.
 
         if USE_CONTRASTIVE_LOSS:
             contrast_input = input_seq.clone()
@@ -216,14 +218,26 @@ for epoch in range(num_epochs):
             global_step = epoch * len(loader) + batch_idx
             # === PCA logging for resonant token trajectories ===
             if res_tokens is not None and res_tokens.numel() > 0:
-                flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
-                if flat_tokens.shape[0] >= 2:
-                    pca = PCA(n_components=2)
-                    projected = pca.fit_transform(flat_tokens)
-                    for i in range(min(res_tokens.size(1), 8)):
+                if res_tokens is not None and res_tokens.numel() > 0:
+                    # Flatten across batch dimension
+                    token_count = res_tokens.size(1)
+                    flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
+                    if flat_tokens.shape[0] >= 2:
+                        pca = PCA(n_components=2)
+                        projected = pca.fit_transform(flat_tokens)
+                        num_batches = res_tokens.size(0)
+                        # Repeat token indices for each batch row
+                        token_indices = np.tile(np.arange(token_count), num_batches)
+
+                        data = [[float(x), float(y), int(label)] for (x, y), label in zip(projected.tolist(), token_indices)]
+                        table = wandb.Table(data=data, columns=["x", "y", "label"])
                         wandb.log({
-                            f"res_token_{i}_pca_x": projected[i, 0],
-                            f"res_token_{i}_pca_y": projected[i, 1],
+                            "resonant_tokens_pca": wandb.plot.scatter(
+                                table,
+                                x="x",
+                                y="y",
+                                title="Resonant Tokens PCA"
+                            )
                         }, step=global_step)
             print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
             wandb.log({

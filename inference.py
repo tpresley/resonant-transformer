@@ -72,10 +72,11 @@ while True:
         for _ in range(100):
             input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long).unsqueeze(0).to(DEVICE)
             logits, _ = model(input_seq, context=resonant_context if resonant_context is not None else input_seq)
-            probs = torch.softmax(logits[0, -1] / 0.8, dim=0)
+            probs = torch.softmax(logits[0, -1] / 0.9, dim=0)
             topk_probs, topk_indices = torch.topk(probs, 40)
             next_token = topk_indices[torch.multinomial(topk_probs, 1)].item()
             generated.append(next_token)
 
     output_text = tokenizer.decode(generated[len(tokens):], skip_special_tokens=True)
+    output_text = output_text.replace("Ġ", " ").replace("@@", "").replace("â", "'").strip()
     print("Generated continuation:", output_text.strip())
