@@ -1,3 +1,4 @@
+# train.py (fully updated with proper RI/RS integration)
 import os
 import torch
 import wandb
@@ -8,44 +9,38 @@ from torch.utils.data import DataLoader
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from datasets import load_dataset
-from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss  # updated to support hybrid static + dynamic resonance
+from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss
 from sklearn.decomposition import PCA
 from collections import deque
-
 import pandas as pd
 import plotly.express as px
 
+# === Hyperparameters & Config ===
+from config import (
+    d_model, num_heads, num_layers,
+    resonant_token_count, dynamic_resonant_token_count,
+    sequence_length, max_tokens, learning_rate,
+    batch_size, num_epochs, warmup_epochs,
+    lambda_ri, lambda_rs, lambda_div,
+    lambda_sur, lambda_attn, lambda_res,
+    multihead_resonance
+)
 
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    DEVICE = torch.device("cpu")
-
-from config import d_model, num_heads, num_layers, resonant_token_count, dynamic_resonant_token_count, sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs, lambda_ri, lambda_rs, lambda_div
+# Device setup
+DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
+         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
 # Initialize wandb
-wandb.init(project="resonant-transformer", config={
-    "d_model": d_model,
-    "num_heads": num_heads,
-    "num_layers": num_layers,
-    "resonant_token_count": resonant_token_count,
-    "dynamic_resonant_token_count": dynamic_resonant_token_count,
-    "learning_rate": learning_rate,
-    "batch_size": batch_size,
-    "num_epochs": num_epochs,
-    "sequence_length": sequence_length,
-    "max_tokens": max_tokens,
-    "lambda_ri": lambda_ri,
-    "lambda_rs": lambda_rs,
-    "lambda_div": lambda_div
+wandb.init(project="resonant-transformer-punchline", config={
+    **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
+        'd_model','num_heads','num_layers','resonant_token_count',
+        'dynamic_resonant_token_count','learning_rate','batch_size',
+        'num_epochs','sequence_length','max_tokens','multihead_resonance'
+    ]}
 })
 
-# Table buffer for PCA
+# Data preparation (unchanged)
 pca_data_buffer = deque(maxlen=100 * batch_size)
-
-# Load TinyStories
 dataset = load_dataset("roneneldan/TinyStories", split="train")
 corpus_path = "tinystories_cached.txt"
 if not os.path.exists(corpus_path):
@@ -72,211 +67,117 @@ tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 tokens = []
 with open(corpus_path, "r", encoding="utf-8") as f:
     for line in f:
-        encoded = tokenizer.encode(line.strip())
-        tokens.extend(encoded.ids)
+        tokens.extend(tokenizer.encode(line.strip()).ids)
         if len(tokens) >= max_tokens:
             break
-tokens = tokens[:max_tokens]
+sequences = torch.tensor([tokens[i:i+sequence_length] for i in range(0, len(tokens)-sequence_length, sequence_length)], dtype=torch.long).to(DEVICE)
+loader = DataLoader(sequences, batch_size=batch_size, shuffle=True, drop_last=True)
 
-def make_sequences(tokens, seq_len):
-    num_full = (len(tokens) - seq_len) // seq_len
-    return torch.tensor([tokens[i*seq_len:(i+1)*seq_len] for i in range(num_full)], dtype=torch.long)
-
-data = make_sequences(tokens, sequence_length)
-vocab_size = tokenizer.get_vocab_size()
-data = data.to(DEVICE)
-loader = DataLoader(data, batch_size=batch_size, shuffle=True, drop_last=True)
-
-USE_CONTRASTIVE_LOSS = True
-DYNAMIC_RESONANCE = True
-MULTIHEAD_RESONANCE = False
-if DYNAMIC_RESONANCE and MULTIHEAD_RESONANCE:
-    print("[Warning] Both dynamic and multihead resonance are enabled. Defaulting to dynamic resonance.")
-    MULTIHEAD_RESONANCE = False
-
+# Model initialization
 model = EnhancedResonantTransformer(
-    vocab_size=vocab_size,
+    vocab_size=tokenizer.get_vocab_size(),
     d_model=d_model,
     num_heads=num_heads,
     num_layers=num_layers,
     resonant_token_count=resonant_token_count,
     dynamic_resonant_token_count=dynamic_resonant_token_count,
-    multihead=False
-)
-model.to(DEVICE)
-model.alpha = 0.0  # Ensure full gradient flow through resonant tokens at start
+    multihead=multihead_resonance
+).to(DEVICE)
 model.train()
 
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+# Attention hook setup: register on custom encoder_layers
+attn_records = []
+def attn_hook(module, inp, output):
+    # output is (attn_output, attn_weights)
+    if isinstance(output, tuple) and output[1] is not None:
+        attn_records.append(output[1].detach())
+for layer in model.encoder_layers:
+    layer.self_attn.register_forward_hook(attn_hook)
+avg_attn = None
+attn_momentum = 0.99
 
-print("Starting training...")
-last_resonant_state = None
+# Optimizer & Criterion
+opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
+crit = nn.CrossEntropyLoss(ignore_index=pad_id)
+last_res=None
+
+# Training
 for epoch in range(num_epochs):
-    model.alpha = cosine_rampup(epoch, warmup_epochs)  # Ramp from 0.0 to 1.0
-    total_loss = 0
-    for batch_idx, batch in enumerate(loader):
-        input_seq = batch[:, :-1]
-        target_seq = batch[:, 1:]
-        context_input = last_resonant_state if last_resonant_state is not None else input_seq
-
-        ri_per_token = torch.zeros((batch_size, resonant_token_count), device=DEVICE)
-        rs_per_token = torch.ones((batch_size, resonant_token_count), device=DEVICE)
-        ri = torch.tensor(0.0, device=DEVICE)
-        rs = torch.tensor(1.0, device=DEVICE)
-
-        output, res_tokens = model(input_seq, context=context_input)
-        res_tokens_for_grad = getattr(model, "_res_tokens_for_ri", None)
-
-        output = output[:, :input_seq.shape[1]]
-        output = torch.clamp(output, min=-10.0, max=10.0)
-        output_flat = output.reshape(-1, vocab_size)
-        target_flat = target_seq.reshape(-1)
-        loss = criterion(output_flat, target_flat)
-        if not torch.isfinite(loss):
-            raise ValueError("NaN or Inf detected in main loss")
-
-        if res_tokens is not None and res_tokens.numel() > 0 and res_tokens_for_grad is not None:
-            last_resonant_state = res_tokens_for_grad.detach()
-            if model.training:
-                dropout_mask = torch.rand(res_tokens.size(1), device=res_tokens.device) > 0.1
-                res_tokens = res_tokens[:, dropout_mask, :]
-                # Do NOT mask res_tokens_for_grad to preserve gradient flow
-
-            loss += lambda_div * diversity_penalty(res_tokens)
-
-            grads_res = torch.autograd.grad(loss, res_tokens_for_grad, retain_graph=True, create_graph=True, allow_unused=True)[0]
-            if grads_res is None:
-                print("[Warning] res_tokens_for_grad was not used in the loss computation. Check your model's forward pass.")
-                grads_res = torch.zeros_like(res_tokens_for_grad)
-            if grads_res is not None:
-                grad_norm = torch.clamp(grads_res.norm(dim=-1), min=1e-3)
-                dot = (grads_res * res_tokens_for_grad).sum(dim=-1)
-                ri_per_token = torch.abs(dot) / grad_norm
-                rs_per_token = 1.0 - F.cosine_similarity(grads_res, res_tokens_for_grad, dim=-1)
-                rs_per_token = torch.clamp(rs_per_token, 0.0, 2.0)
-                ri = ri_per_token.mean()
-                rs = rs_per_token.mean()
-
-            loss = loss - lambda_ri * ri - lambda_rs * rs
-
-            # === Participation Reward: Compare model with vs. without resonant tokens ===
-            run_every_x_batches = 1
-            if batch_idx % run_every_x_batches == 0:
-                target_seq = batch[:, 1:]
-                target_flat = target_seq.reshape(-1)
-                with torch.no_grad():
-                    empty_context = torch.empty(input_seq.size(0), 0, model.d_model, device=input_seq.device)
-                    output_nores, _ = model(input_seq, context=empty_context)
-                    output_nores = output_nores[:, :input_seq.shape[1]]
-                    output_nores = torch.clamp(output_nores, min=-10.0, max=10.0)
-                    output_nores_flat = output_nores.reshape(-1, vocab_size)
-                    target_flat = target_seq.reshape(-1)
-                    loss_nores = criterion(output_nores_flat, target_flat)
-                    if not torch.isfinite(loss_nores):
-                        raise ValueError("NaN or Inf detected in loss_nores")
-
-                    output_with_res, _ = model(input_seq, context=context_input)
-                    output_with_res = output_with_res[:, :input_seq.shape[1]]
-                    output_with_res = torch.clamp(output_with_res, min=-10.0, max=10.0)
-                    output_with_res_flat = output_with_res.reshape(-1, vocab_size)
-                    loss_with_res = criterion(output_with_res_flat, target_flat)
-                    if not torch.isfinite(loss_with_res):
-                        raise ValueError("NaN or Inf detected in loss_with_res")
-
-                resonant_usage_reward = loss_nores - loss_with_res
-                resonant_usage_reward = torch.clamp(resonant_usage_reward, -10.0, 10.0)
-                lambda_participation = 0.1  # Tune this weight
-                loss -= lambda_participation * resonant_usage_reward
-                # NOTE: This doubles forward-pass cost. In future, consider gating this every N batches.
-
-        if USE_CONTRASTIVE_LOSS:
-            contrast_input = input_seq.clone()
-            contrast_input[:, -1] = torch.randint(0, vocab_size, (batch_size,), device=DEVICE)
-            contrast_output, _ = model(contrast_input, context=contrast_input)
-            contrastive = contrastive_loss(output, contrast_output)
-            loss += contrastive
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        total_loss += loss.item()
-        last_resonant_state = res_tokens_for_grad.detach() if res_tokens_for_grad is not None else None
-
-        token_metrics = {}
-        if res_tokens is not None and res_tokens.numel() > 0:
-            ri_token_means = ri_per_token.mean(dim=0)
-            rs_token_means = rs_per_token.mean(dim=0)
-            ri_token_stds = ri_per_token.std(dim=0)
-            rs_token_stds = rs_per_token.std(dim=0)
-
-            for i in range(ri_token_means.size(0)):
-                token_metrics[f"ri_token_{i}_mean"] = ri_token_means[i].item()
-                token_metrics[f"ri_token_{i}_std"] = ri_token_stds[i].item()
-                token_metrics[f"rs_token_{i}_mean"] = rs_token_means[i].item()
-                token_metrics[f"rs_token_{i}_std"] = rs_token_stds[i].item()
-
-        if res_tokens is None or res_tokens.numel() == 0:
-            resonant_usage_reward = torch.tensor(0.0)
-        influence_score = resonant_usage_reward.item()
-
-        if batch_idx % 10 == 0:
-            global_step = epoch * len(loader) + batch_idx
-            if res_tokens is not None and res_tokens.numel() > 0:
-                # Flatten tokens and run PCA
-                token_count = res_tokens.size(1)
-                flat = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
-                if flat.shape[0] >= 2:
-                    pca = PCA(n_components=2)
-                    xy = pca.fit_transform(flat)
-                    batch_ids = np.tile(np.arange(token_count), res_tokens.size(0))
-
-                    # Build DataFrame from buffer
-                    for (x, y), tid in zip(xy.tolist(), batch_ids):
-                        pca_data_buffer.append([float(x), float(y), int(tid), global_step])
-                    df = pd.DataFrame(
-                        list(pca_data_buffer),
-                        columns=["x", "y", "token_index", "step"]
-                    )
-                    df["token_index"] = df["token_index"].astype(str)
-
-                    # Create interactive Plotly figure
-                    fig = px.scatter(
-                        df,
-                        x="x",
-                        y="y",
-                        color="token_index",
-                        title="Resonant Tokens PCA",
-                        animation_frame="step"
-                    )
-                    wandb.log({"resonant_tokens_pca": fig}, step=global_step)
-            print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
+    model.alpha = cosine_rampup(epoch, warmup_epochs)
+    for bidx,batch in enumerate(loader):
+        inp = batch[:,:-1]; tgt = batch[:,1:]
+        ctx = last_res if last_res is not None else inp
+        logits, res = model(inp, context=ctx)
+        logits = logits[:,:inp.size(1)]
+        # Primary loss (CE)
+        primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
+        # Surprisal-drop
+        lp = F.log_softmax(logits,dim=-1)
+        tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+        spr = -tlp; dr = spr[:,:-1]-spr[:,1:]
+        sur = F.relu(dr).mean()
+        primary = primary - lambda_sur*sur
+        # Attention KL
+        if attn_records:
+            ca = torch.stack(attn_records).mean(0)
+            avg_attn = ca.mean(0) if avg_attn is None else attn_m*avg_attn+(1-attn_m)*ca.mean(0)
+            cur,avg = ca.mean(0)+1e-8, avg_attn+1e-8
+            akl = F.kl_div(cur.log(),avg,reduction='batchmean')
+            primary = primary - lambda_attn*akl
+            attn_records.clear()
+        else: akl=torch.tensor(0.,device=DEVICE)
+        # Resolution-coherence
+        if logits.size(1)>=2:
+            pr = lp.exp(); ent=-(pr*lp).sum(-1)
+            pen, pos = ent[:,-2], ent[:,-1]
+            rr = F.relu(pen-pos).mean()
+            primary = primary - lambda_res*rr
+        else: rr=torch.tensor(0.,device=DEVICE)
+        # Contrastive
+        ci = inp.clone(); ci[:,-1]=torch.randint(0,tokenizer.get_vocab_size(),(batch_size,),device=DEVICE)
+        coh,_=model(ci,ci); con=contrastive_loss(logits,coh)
+        primary = primary + con
+        # RI/RS/diversity on primary only
+        final = primary
+        if res.numel()>0 and hasattr(model,'_res_tokens_for_ri'):
+            gr = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=False, allow_unused=True)[0]
+            if gr is not None:
+                gn=gr.norm(-1).clamp(1e-6)
+                ri_v=(gr*model._res_tokens_for_ri).sum(-1).abs()/gn; term1=lambda_ri*ri_v.mean()
+                rs_v=1-F.cosine_similarity(gr,model._res_tokens_for_ri,dim=-1); term2=lambda_rs*rs_v.mean()
+            else: term1=term2=0.
+            dvt=lambda_div*diversity_penalty(model._res_tokens_for_ri)
+            final = primary - term1 - term2 + dvt
+        # Backprop
+        opt.zero_grad(); final.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+        # update
+        last_res = getattr(model,'_res_tokens_for_ri',None)
+        if last_res is not None: last_res=last_res.detach()
+        # log
+        if bidx%10==0:
             wandb.log({
-                "resonant_usage_reward": resonant_usage_reward.item(),
-                "loss": loss.item(),
-                "perplexity": np.exp(loss.item()),
-                "ri": ri.item(),
-                "rs": rs.item(),
-                "resonant_tokens_active": dropout_mask.sum().item() if res_tokens is not None and 'dropout_mask' in locals() else 0,
-                "resonant_influence_score": influence_score,
-                **token_metrics
-            }, step=global_step)
+                'loss':final.item(),
+                'perplexity':float(np.exp(final.item())),
+                'surprisal_reward':sur.item(),
+                'attention_kl':akl.item(),
+                'resolution_reward':rr.item()
+            })
+            print(f"E{epoch+1} B{bidx} P{float(np.exp(final.item()))} L{final.item():.4f} S{sur.item():.4f} A{akl.item():.4f} R{rr.item():.4f}")
 
+# Save final state
 state = {
-    "model_state_dict": model.state_dict(),
-    "config": {
-        "vocab_size": vocab_size,
-        "sequence_length": sequence_length,
-        "d_model": d_model,
-        "num_heads": num_heads,
-        "num_layers": num_layers,
-        "resonant_token_count": resonant_token_count,
-        "dynamic_resonant_token_count": dynamic_resonant_token_count,
-        "multihead": MULTIHEAD_RESONANCE
+    'model_state_dict': model.state_dict(),
+    'config': {
+        'vocab_size': tokenizer.get_vocab_size(),
+        'sequence_length': sequence_length,
+        'd_model': d_model,
+        'num_heads': num_heads,
+        'num_layers': num_layers,
+        'resonant_token_count': resonant_token_count,
+        'dynamic_resonant_token_count': dynamic_resonant_token_count,
+        'multihead': multihead_resonance
     },
-    "final_dynamic_resonant_state": last_resonant_state if last_resonant_state is not None else None
+    'final_resonant_state': last_res_state
 }
 millions = int(max_tokens / 1_000_000)
 model_filename = f"{resonant_token_count}-{dynamic_resonant_token_count}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M.pt"

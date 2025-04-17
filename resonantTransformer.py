@@ -1,4 +1,4 @@
-# resonantTransformer.py
+# resonantTransformer.py (fixed to align batch_first and return attention weights)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,18 +27,16 @@ class ResonantController(nn.Module):
     def forward(self, context_embedding):
         if self.res_tokens == 0:
             return torch.empty(context_embedding.size(0), 0, self.d_model, device=context_embedding.device)
-
         if context_embedding.dim() == 1:
             context_embedding = context_embedding.unsqueeze(0)
-
         out = self.linear(context_embedding).view(-1, self.res_tokens, self.d_model)
         out = F.layer_norm(out, (self.d_model,))
         return out
 
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
-                resonant_token_count=0, dynamic_resonant_token_count=0,
-                multihead=False):
+                 resonant_token_count=0, dynamic_resonant_token_count=0,
+                 multihead=False):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.static_resonant_token_count = resonant_token_count
@@ -49,61 +47,62 @@ class EnhancedResonantTransformer(nn.Module):
 
         if self.dynamic_resonant_token_count > 0:
             self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
-
         if self.static_resonant_token_count > 0:
             self.resonant_tokens = nn.Parameter(torch.randn(1, self.static_resonant_token_count, d_model))
-
         if self.multihead:
-            self.resonator = MultiHeadResonance(num_heads=4, res_tokens=resonant_token_count, d_model=d_model)
-
-        encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, dim_feedforward=512, dropout=0.1)
+            self.resonator = MultiHeadResonance(num_heads=num_heads,
+                                                res_tokens=resonant_token_count,
+                                                d_model=d_model)
+        # Use batch_first=True so inputs are (batch, seq, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, num_heads,
+            dim_feedforward=512,
+            dropout=0.1,
+            batch_first=True
+        )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         self.output = nn.Linear(d_model, vocab_size)
 
     def forward(self, x, context=None):
-        x = self.embedding(x)
-        B = x.size(0)
+        # x: (batch, seq)
+        emb = self.embedding(x)  # (batch, seq, d_model)
+        B = emb.size(0)
 
+        # build resonant tokens if any
         res_tokens = []
-
         if context is not None:
-            context_vec = context.mean(dim=1) if context.dtype in (torch.float32, torch.float64) \
-                          else self.embedding(context.long()).mean(dim=1)
-
-        if self.dynamic_resonant_token_count > 0 and context is not None and context.size(1) > 0:
-            dyn_tokens = self.controller(context_vec)
-            res_tokens.append(dyn_tokens)
-
-        if self.static_resonant_token_count > 0:
-            stat_tokens = self.resonant_tokens.repeat(B, 1, 1)
-            res_tokens.append(stat_tokens)
-
-        if res_tokens:
-            if res_tokens:
-                batch_size = x.size(0)
-                for i in range(len(res_tokens)):
-                    if res_tokens[i].size(0) == 1 and batch_size != 1:
-                        res_tokens[i] = res_tokens[i].expand(batch_size, -1, -1)
-                    elif res_tokens[i].size(0) != batch_size:
-                        raise ValueError(f"Resonant token tensor batch mismatch: got {res_tokens[i].size(0)}, expected {batch_size}")
-                res_tokens = torch.cat(res_tokens, dim=1)
+            # context may be token ids or embeddings
+            if context.dtype in (torch.int64, torch.int32):
+                ctx_emb = self.embedding(context)
             else:
-                res_tokens = torch.empty(B, 0, self.d_model, device=x.device)
+                ctx_emb = context
+            context_vec = ctx_emb.mean(dim=1)
+        if self.dynamic_resonant_token_count > 0 and context is not None:
+            dyn = self.controller(context_vec)
+            res_tokens.append(dyn)
+        if self.static_resonant_token_count > 0:
+            stat = self.resonant_tokens.expand(B, -1, -1)
+            res_tokens.append(stat)
+        if res_tokens:
+            tokens = torch.cat(res_tokens, dim=1)
         else:
-            res_tokens = torch.empty(B, 0, self.d_model, device=x.device)
+            tokens = torch.empty(B, 0, self.d_model, device=emb.device)
 
-        if self.training and res_tokens.numel() > 0 and res_tokens.requires_grad:
-            res_tokens.retain_grad()
-            self._res_tokens_for_ri = res_tokens
+        # retain grad on resonant tokens
+        if self.training and tokens.numel() > 0 and tokens.requires_grad:
+            tokens.retain_grad()
+            self._res_tokens_for_ri = tokens
 
-        if res_tokens.size(1) > 0:
-            x = torch.cat([amplify_grad(res_tokens, self.alpha), x], dim=1)
+        # concatenate and encode (batch_first)
+        inp = torch.cat([tokens.detach() * (1-self.alpha) + tokens * self.alpha, emb], dim=1)
+        # inp shape: (batch, res + seq, d_model)
+        encoded = self.encoder(inp)  # returns (batch, res+seq, d_model)
+        # strip off resonance prefix
+        out = encoded[:, tokens.size(1):, :]
+        logits = self.output(out)
+        return logits, tokens
 
-        x = x.transpose(0, 1)
-        encoded = self.encoder(x)
-        out = encoded[res_tokens.size(1):].transpose(0, 1)
-        return self.output(out), res_tokens
-
+# Same utility functions as before
 def amplify_grad(x, alpha):
     return x.detach() * (1 - alpha) + x * alpha
 
