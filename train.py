@@ -12,6 +12,10 @@ from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, 
 from sklearn.decomposition import PCA
 from collections import deque
 
+import pandas as pd
+import plotly.express as px
+
+
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 elif torch.cuda.is_available():
@@ -221,23 +225,33 @@ for epoch in range(num_epochs):
         if batch_idx % 10 == 0:
             global_step = epoch * len(loader) + batch_idx
             if res_tokens is not None and res_tokens.numel() > 0:
+                # Flatten tokens and run PCA
                 token_count = res_tokens.size(1)
-                flat_tokens = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
-                if flat_tokens.shape[0] >= 2:
+                flat = res_tokens.reshape(-1, res_tokens.size(-1)).detach().cpu().numpy()
+                if flat.shape[0] >= 2:
                     pca = PCA(n_components=2)
-                    projected = pca.fit_transform(flat_tokens)
-                    num_batches = res_tokens.size(0)
-                    token_indices = np.tile(np.arange(token_count), num_batches)
-                    for (x, y), label in zip(projected.tolist(), token_indices):
-                        pca_data_buffer.append([float(x), float(y), int(label), global_step])
-                    table = wandb.Table(columns=["x", "y", "label", "step"])
-                    for row in pca_data_buffer:
-                        table.add_data(*row)
-                    wandb.log({
-                        "resonant_tokens_pca": wandb.plot.scatter(
-                            table, x="x", y="y", title="Resonant Tokens PCA")
-                    }, step=global_step)
+                    xy = pca.fit_transform(flat)
+                    batch_ids = np.tile(np.arange(token_count), res_tokens.size(0))
 
+                    # Build DataFrame from buffer
+                    for (x, y), tid in zip(xy.tolist(), batch_ids):
+                        pca_data_buffer.append([float(x), float(y), int(tid), global_step])
+                    df = pd.DataFrame(
+                        list(pca_data_buffer),
+                        columns=["x", "y", "token_index", "step"]
+                    )
+                    df["token_index"] = df["token_index"].astype(str)
+
+                    # Create interactive Plotly figure
+                    fig = px.scatter(
+                        df,
+                        x="x",
+                        y="y",
+                        color="token_index",
+                        title="Resonant Tokens PCA",
+                        animation_frame="step"
+                    )
+                    wandb.log({"resonant_tokens_pca": fig}, step=global_step)
             print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | PPL: {np.exp(loss.item()):.2f} | RI: {ri.item():.4f} | RS: {rs.item():.4f} | Influence: {influence_score:.2f}")
             wandb.log({
                 "resonant_usage_reward": resonant_usage_reward.item(),
