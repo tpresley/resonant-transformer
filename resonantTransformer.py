@@ -51,7 +51,8 @@ class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
                  resonant_token_count=0, dynamic_resonant_token_count=0,
-                 multihead=False):
+                 multihead=False,
+                 max_recursive_steps: int = 3):
         super().__init__()
         self.global_res = None
         self.surprisal_trajectory = []
@@ -61,6 +62,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.static_resonant_token_count = resonant_token_count
         self.dynamic_resonant_token_count = dynamic_resonant_token_count
         self.multihead = multihead
+        self.max_recursive_steps = max_recursive_steps
         self.d_model = d_model
         self.alpha = 0.0
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
@@ -89,7 +91,6 @@ class EnhancedResonantTransformer(nn.Module):
         self_tok = self.self_token.expand(B, -1, -1)
         emb = torch.cat([self_tok, emb], dim=1)
 
-        res_list = []
         # Compute context vector
         if context is not None:
             if context.dtype in (torch.int64, torch.int32):
@@ -104,8 +105,21 @@ class EnhancedResonantTransformer(nn.Module):
             # [SELF] fallback — shape (1, 1, D), expand then mean -> (B, D)
             context_vec = self.self_token.expand(x.size(0), -1, -1).mean(dim=1)
 
+        res_list = []
+        if self.static_resonant_token_count > 0:
+            # replicate static bank across the batch
+            static = self.resonant_tokens.expand(B, -1, -1)
+            res_list.append(static)
+        if self.dynamic_resonant_token_count > 0:
+            # controller generates dynamic tokens from context
+            dyn = self.controller(context_vec)
+            res_list.append(dyn)
+        if self.multihead:
+            # multi‑head mixture of static bank
+            mh = self.resonator(context_vec)
+            res_list.append(mh)
 
-        tokens = torch.cat(res_list, dim=1) if res_list else torch.empty(B, 0, self.d_model, device=emb.device)
+        tokens = torch.cat(res_list, dim=1)
 
         if self.training and tokens.numel() > 0 and tokens.requires_grad:
             tokens.retain_grad()
@@ -144,7 +158,9 @@ class EnhancedResonantTransformer(nn.Module):
         epsilon = 1e-3  # Resolution convergence threshold
 
         for step in range(max_steps):
-            logits, res, attn_maps = self.forward(x, context=self.global_res)
+            if max_steps is None:
+                max_steps = self.max_recursive_steps
+            logits, res, attn_maps = self.forward(x)
 
             if logits is not None:
                 self.surprisal_trajectory.append(logits.detach())
@@ -167,6 +183,7 @@ class EnhancedResonantTransformer(nn.Module):
                     break
             prev_res = res.detach()
 
+        self.last_recursive_steps = step + 1
         return logits, res
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):

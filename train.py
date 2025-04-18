@@ -24,7 +24,8 @@ from config import (
     batch_size, num_epochs, warmup_epochs,
     lambda_ri, lambda_rs, lambda_div,
     lambda_sur, lambda_attn, lambda_res,
-    multihead_resonance
+    multihead_resonance,
+    max_recursive_steps
 )
 
 if baseline:
@@ -90,7 +91,8 @@ model = EnhancedResonantTransformer(
     num_layers=num_layers,
     resonant_token_count = resonant_token_count,
     dynamic_resonant_token_count = dynamic_resonant_token_count,
-    multihead = multihead_resonance
+    multihead = multihead_resonance,
+    max_recursive_steps = max_recursive_steps
 ).to(DEVICE)
 model.train()
 
@@ -120,6 +122,7 @@ for epoch in range(num_epochs):
         inp = batch[:,:-1]; tgt = batch[:,1:]
         ctx = last_res if last_res is not None else inp
         logits, res = model.recursive_forward(inp)
+        steps = getattr(model, "last_recursive_steps", 0)
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)
         primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
@@ -251,9 +254,10 @@ for epoch in range(num_epochs):
                 'surprisal_reward':val_sr,
                 'attention_kl':val_akl,
                 'resolution_score':resolution_score,
-                'self_attn_mean':self_attn_mean
+                'self_attn_mean':self_attn_mean,
+                'recursive_steps':steps
             }, step=global_step)
-            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f}")
+            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f} | STEPS: {steps}")
 
 # Save final state
 state = {

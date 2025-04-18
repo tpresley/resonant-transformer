@@ -42,4 +42,4 @@ lambda_attn = 0.1     # attention-divergence weight
 lambda_res = 0.02      # resolution-coherence weight
 
 multihead_resonance = False  # boolean flag for multihead resonance
-
+max_recursive_steps = 3
