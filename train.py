@@ -17,6 +17,7 @@ import plotly.express as px
 
 # === Hyperparameters & Config ===
 from config import (
+    baseline,
     d_model, num_heads, num_layers,
     resonant_token_count, dynamic_resonant_token_count,
     sequence_length, max_tokens, learning_rate,
@@ -25,6 +26,11 @@ from config import (
     lambda_sur, lambda_attn, lambda_res,
     multihead_resonance
 )
+
+if baseline:
+    resonant_token_count = 0
+    dynamic_resonant_token_count = 0
+    multihead_resonance = False
 
 # Device setup
 DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
@@ -40,7 +46,6 @@ wandb.init(project="resonant-transformer-punchline", config={
 })
 
 # Data preparation (unchanged)
-pca_data_buffer = deque(maxlen=100 * batch_size)
 dataset = load_dataset("roneneldan/TinyStories", split="train")
 corpus_path = "tinystories_cached.txt"
 if not os.path.exists(corpus_path):
@@ -73,15 +78,15 @@ with open(corpus_path, "r", encoding="utf-8") as f:
 sequences = torch.tensor([tokens[i:i+sequence_length] for i in range(0, len(tokens)-sequence_length, sequence_length)], dtype=torch.long).to(DEVICE)
 loader = DataLoader(sequences, batch_size=batch_size, shuffle=True, drop_last=True)
 
-# Model initialization
+# Model & Hooks
 model = EnhancedResonantTransformer(
     vocab_size=tokenizer.get_vocab_size(),
     d_model=d_model,
     num_heads=num_heads,
     num_layers=num_layers,
-    resonant_token_count=resonant_token_count,
-    dynamic_resonant_token_count=dynamic_resonant_token_count,
-    multihead=multihead_resonance
+    resonant_token_count = resonant_token_count,
+    dynamic_resonant_token_count = dynamic_resonant_token_count,
+    multihead = multihead_resonance
 ).to(DEVICE)
 model.train()
 
@@ -101,6 +106,9 @@ opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 crit = nn.CrossEntropyLoss(ignore_index=pad_id)
 last_res=None
 
+sur_baseline = None
+res_baseline = None
+
 # Training
 for epoch in range(num_epochs):
     model.alpha = cosine_rampup(epoch, warmup_epochs)
@@ -111,42 +119,83 @@ for epoch in range(num_epochs):
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)
         primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
-        # Surprisal-drop
-        lp = F.log_softmax(logits,dim=-1)
-        tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-        spr = -tlp; dr = spr[:,:-1]-spr[:,1:]
-        sur = F.relu(dr).mean()
-        primary = primary - lambda_sur*sur
-        # Attention KL
-        if attn_records:
+        # — Surprisal‑drop reward (normalized, clipped, baselined) —
+        if not baseline:
+            lp  = F.log_softmax(logits, dim=-1)
+            tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+            spr = -tlp; dr = spr[:,:-1]-spr[:,1:]
+            sur = F.relu(dr).mean() / inp.size(1)        # normalize per token
+            sur = torch.clamp(sur, max=0.5)             # clip to [0, 0.5]
+
+            # update running baseline
+            if sur_baseline is None:
+                sur_baseline = sur.detach()
+            else:
+                sur_baseline = 0.99 * sur_baseline + 0.01 * sur.detach()
+
+            sur_reward = sur - sur_baseline             # only above‐baseline counts
+            primary   = primary - lambda_sur * sur_reward
+        else:
+            sur_reward = torch.tensor(0.0, device=DEVICE)
+
+        # — Attention‑KL reward (capped) —
+        if not baseline and attn_records:
             ca = torch.stack(attn_records).mean(0)
-            avg_attn = ca.mean(0) if avg_attn is None else attn_m*avg_attn+(1-attn_m)*ca.mean(0)
-            cur,avg = ca.mean(0)+1e-8, avg_attn+1e-8
-            akl = F.kl_div(cur.log(),avg,reduction='batchmean')
-            primary = primary - lambda_attn*akl
+            avg_attn = ca.mean(0) if avg_attn is None else (
+                        attn_momentum * avg_attn + (1-attn_momentum) * ca.mean(0)
+                    )
+            cur, avg = ca.mean(0) + 1e-8, avg_attn + 1e-8
+            akl = F.kl_div(cur.log(), avg, reduction='batchmean')
+            akl = torch.clamp(akl, max=0.1)             # cap at 0.1 nats
+            primary = primary - lambda_attn * akl   # modestly upweight if desired
             attn_records.clear()
-        else: akl=torch.tensor(0.,device=DEVICE)
-        # Resolution-coherence
-        if logits.size(1)>=2:
-            pr = lp.exp(); ent=-(pr*lp).sum(-1)
-            pen, pos = ent[:,-2], ent[:,-1]
-            rr = F.relu(pen-pos).mean()
-            primary = primary - lambda_res*rr
-        else: rr=torch.tensor(0.,device=DEVICE)
-        # Contrastive
-        ci = inp.clone(); ci[:,-1]=torch.randint(0,tokenizer.get_vocab_size(),(batch_size,),device=DEVICE)
-        coh,_=model(ci,ci); con=contrastive_loss(logits,coh)
-        primary = primary + con
-        # RI/RS/diversity on primary only
+        else:
+            akl = torch.tensor(0.0, device=DEVICE)
+
+        # — Resolution‑coherence reward (clipped, baselined) —
+        if not baseline and logits.size(1) >= 2:
+            pr  = lp.exp()
+            ent = -(pr * lp).sum(-1)
+            pen, pos = ent[:, -2], ent[:, -1]
+            rr = F.relu(pen - pos).mean()
+            rr = torch.clamp(rr, max=0.5)
+
+            # update running baseline
+            if res_baseline is None:
+                res_baseline = rr.detach()
+            else:
+                res_baseline = 0.99 * res_baseline + 0.01 * rr.detach()
+
+            res_reward = rr - res_baseline
+            primary    = primary - lambda_res * res_reward
+        else:
+            res_reward = torch.tensor(0.0, device=DEVICE)
+
+        # — Contrastive term unchanged —
+        if not baseline:
+            ci = inp.clone()
+            ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
+            coh, _ = model(ci, ci)
+            con = contrastive_loss(logits, coh)
+            primary = primary + con
+        else:
+            con = torch.tensor(0.0, device=DEVICE)
+
+        # — RI/RS/diversity on the prefix tokens unchanged —
         final = primary
-        if res.numel()>0 and hasattr(model,'_res_tokens_for_ri'):
-            gr = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=False, allow_unused=True)[0]
+        if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
+            gr = torch.autograd.grad(primary, model._res_tokens_for_ri,
+                                    retain_graph=True, create_graph=False,
+                                    allow_unused=True)[0]
             if gr is not None:
-                gn=gr.norm(-1).clamp(1e-6)
-                ri_v=(gr*model._res_tokens_for_ri).sum(-1).abs()/gn; term1=lambda_ri*ri_v.mean()
-                rs_v=1-F.cosine_similarity(gr,model._res_tokens_for_ri,dim=-1); term2=lambda_rs*rs_v.mean()
-            else: term1=term2=0.
-            dvt=lambda_div*diversity_penalty(model._res_tokens_for_ri)
+                gn     = gr.norm(-1).clamp(1e-6)
+                ri_v   = (gr * model._res_tokens_for_ri).sum(-1).abs() / gn
+                term1  = lambda_ri * ri_v.mean()
+                rs_v   = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+                term2  = lambda_rs * rs_v.mean()
+            else:
+                term1 = term2 = 0.0
+            dvt = lambda_div * diversity_penalty(model._res_tokens_for_ri)
             final = primary - term1 - term2 + dvt
         # Backprop
         opt.zero_grad(); final.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
@@ -155,14 +204,34 @@ for epoch in range(num_epochs):
         if last_res is not None: last_res=last_res.detach()
         # log
         if bidx%10==0:
+            global_step = epoch * len(loader) + bidx
+
+            if (resonant_token_count + dynamic_resonant_token_count) == 0:
+                val_ri = 0.0
+                val_rs = 0.0
+            else:
+                val_ri = ri_v.mean().item()
+                val_rs = rs_v.mean().item()
+
+            if baseline:
+                val_sr = 0.0
+                val_akl = 0.0
+                val_rr = 0.0
+            else:
+                val_sr = sur.item()
+                val_akl = akl.item()
+                val_rr = rr.item()
+
             wandb.log({
                 'loss':final.item(),
                 'perplexity':float(np.exp(final.item())),
-                'surprisal_reward':sur.item(),
-                'attention_kl':akl.item(),
-                'resolution_reward':rr.item()
-            })
-            print(f"E{epoch+1} B{bidx} P{float(np.exp(final.item()))} L{final.item():.4f} S{sur.item():.4f} A{akl.item():.4f} R{rr.item():.4f}")
+                'ri':val_ri,
+                'rs':val_rs,
+                'surprisal_reward':val_sr,
+                'attention_kl':val_akl,
+                'resolution_reward':val_rr
+            }, step=global_step)
+            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {val_rr:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f}")
 
 # Save final state
 state = {
@@ -173,13 +242,19 @@ state = {
         'd_model': d_model,
         'num_heads': num_heads,
         'num_layers': num_layers,
+        'max_tokens': max_tokens,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'num_epochs': num_epochs,
+        'warmup_epochs': warmup_epochs,
         'resonant_token_count': resonant_token_count,
         'dynamic_resonant_token_count': dynamic_resonant_token_count,
         'multihead': multihead_resonance
     },
-    'final_resonant_state': last_res_state
+    'final_resonant_state': last_res
 }
 millions = int(max_tokens / 1_000_000)
-model_filename = f"{resonant_token_count}-{dynamic_resonant_token_count}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M.pt"
+token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
+model_filename = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M.pt"
 torch.save(state, model_filename)
 print(f"Model saved to {model_filename} with config and final dynamic resonant state embedded.")
