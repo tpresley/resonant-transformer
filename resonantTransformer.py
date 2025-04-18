@@ -1,4 +1,3 @@
-# resonantTransformer.py (with custom encoder layer returning attention weights)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,13 +32,8 @@ class ResonantController(nn.Module):
         out = F.layer_norm(out, (self.d_model,))
         return out
 
-# Custom encoder layer forcing attention weights return
 class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        """
-        Override to get attention weights.
-        """
-        # MultiheadAttention returns (output, weights) when need_weights=True
         src2, attn_weights = self.self_attn(
             src, src, src,
             attn_mask=src_mask,
@@ -59,12 +53,17 @@ class EnhancedResonantTransformer(nn.Module):
                  resonant_token_count=0, dynamic_resonant_token_count=0,
                  multihead=False):
         super().__init__()
+        self.global_res = None
+        self.surprisal_trajectory = []
+        self.attention_trajectory = []
+        self.resolution_score = None
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.static_resonant_token_count = resonant_token_count
         self.dynamic_resonant_token_count = dynamic_resonant_token_count
         self.multihead = multihead
         self.d_model = d_model
         self.alpha = 0.0
+        self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
 
         if self.dynamic_resonant_token_count > 0:
             self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
@@ -74,7 +73,6 @@ class EnhancedResonantTransformer(nn.Module):
             self.resonator = MultiHeadResonance(num_heads=num_heads,
                                                 res_tokens=resonant_token_count,
                                                 d_model=d_model)
-        # Build encoder with custom layers
         layers = [CustomTransformerEncoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -86,46 +84,90 @@ class EnhancedResonantTransformer(nn.Module):
         self.output = nn.Linear(d_model, vocab_size)
 
     def forward(self, x, context=None):
-        # x: (batch, seq)
-        emb = self.embedding(x)  # (batch, seq, d_model)
+        emb = self.embedding(x)
         B = emb.size(0)
+        self_tok = self.self_token.expand(B, -1, -1)
+        emb = torch.cat([self_tok, emb], dim=1)
 
-        # build resonant tokens
         res_list = []
+        # Compute context vector
         if context is not None:
             if context.dtype in (torch.int64, torch.int32):
                 ctx_emb = self.embedding(context)
             else:
                 ctx_emb = context
             context_vec = ctx_emb.mean(dim=1)
-        if self.dynamic_resonant_token_count > 0 and context is not None:
-            res_list.append(self.controller(context_vec))
-        if self.static_resonant_token_count > 0:
-            res_list.append(self.resonant_tokens.expand(B, -1, -1))
+        elif self.global_res is not None:
+            # global_res shape: (1, T, D), so mean -> (1, D), expand to (B, D)
+            context_vec = self.global_res.mean(dim=1).expand(x.size(0), -1).contiguous()
+        else:
+            # [SELF] fallback — shape (1, 1, D), expand then mean -> (B, D)
+            context_vec = self.self_token.expand(x.size(0), -1, -1).mean(dim=1)
+
+
         tokens = torch.cat(res_list, dim=1) if res_list else torch.empty(B, 0, self.d_model, device=emb.device)
 
-        # retain grad
         if self.training and tokens.numel() > 0 and tokens.requires_grad:
             tokens.retain_grad()
             self._res_tokens_for_ri = tokens
 
-        # concat and encode
-        inp = torch.cat([tokens.detach() * (1-self.alpha) + tokens * self.alpha, emb], dim=1)
+        inp = torch.cat([tokens.detach() * (1 - self.alpha) + tokens * self.alpha, emb], dim=1)
         attn_maps = []
         out = inp
         for layer in self.encoder_layers:
             out, weights = layer(out)
             attn_maps.append(weights)
-        # strip resonant prefix
+
         seq_out = out[:, tokens.size(1):, :]
         logits = self.output(seq_out)
-        # return logits plus collected attn_maps for hooks if desired
-        return logits, tokens
+        res = tokens
 
-# Same utility functions as before
-def amplify_grad(x, alpha):
-    return x.detach() * (1 - alpha) + x * alpha
+        # Update global_res using EMA
+        momentum = 0.9
+        batch_mean_res = res.mean(dim=0, keepdim=True)  # shape: (1, res_tokens, d_model)
+        if self.global_res is None:
+            self.global_res = batch_mean_res.detach()
+        else:
+            self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
+        return logits, res, attn_maps
+
+    def recursive_forward(self, x, max_steps=3, tol=1e-3):
+        self.surprisal_trajectory.clear()
+        self.attention_trajectory.clear()
+
+        prev_res = None
+        res = None
+        logits = None
+
+        prev_score = None
+        epsilon = 1e-3  # Resolution convergence threshold
+
+        for step in range(max_steps):
+            logits, res, attn_maps = self.forward(x, context=self.global_res)
+
+            if logits is not None:
+                self.surprisal_trajectory.append(logits.detach())
+            if attn_maps:
+                self.attention_trajectory.append(attn_maps[-1].detach())
+
+            if len(self.surprisal_trajectory) > 1:
+                init = self.surprisal_trajectory[0]
+                final = self.surprisal_trajectory[-1]
+                self.resolution_score = (init - final).norm().item()
+
+                if prev_score is not None and abs(prev_score - self.resolution_score) < epsilon:
+                    break  # stop early due to semantic convergence
+
+                prev_score = self.resolution_score
+
+            if prev_res is not None and res is not None:
+                delta = (res - prev_res).norm()
+                if delta < tol:
+                    break
+            prev_res = res.detach()
+
+        return logits, res
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):
     orig_repr = original_logits.mean(dim=1)

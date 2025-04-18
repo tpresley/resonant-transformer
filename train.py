@@ -36,8 +36,12 @@ if baseline:
 DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
          torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
+token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
+millions = int(max_tokens / 1_000_000)
+run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
+
 # Initialize wandb
-wandb.init(project="resonant-transformer-punchline", config={
+wandb.init(project="resonant-transformer-recursive", name=run_name, config={
     **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
         'd_model','num_heads','num_layers','resonant_token_count',
         'dynamic_resonant_token_count','learning_rate','batch_size',
@@ -115,7 +119,7 @@ for epoch in range(num_epochs):
     for bidx,batch in enumerate(loader):
         inp = batch[:,:-1]; tgt = batch[:,1:]
         ctx = last_res if last_res is not None else inp
-        logits, res = model(inp, context=ctx)
+        logits, res = model.recursive_forward(inp)
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)
         primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
@@ -175,7 +179,7 @@ for epoch in range(num_epochs):
         if not baseline:
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
-            coh, _ = model(ci, ci)
+            coh, res, _ = model(ci, ci)
             con = contrastive_loss(logits, coh)
             primary = primary + con
         else:
@@ -183,6 +187,8 @@ for epoch in range(num_epochs):
 
         # — RI/RS/diversity on the prefix tokens unchanged —
         final = primary
+        ri_v = torch.tensor(0.0, device=DEVICE)
+        rs_v = torch.tensor(0.0, device=DEVICE)
         if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
             gr = torch.autograd.grad(primary, model._res_tokens_for_ri,
                                     retain_graph=True, create_graph=False,
@@ -205,6 +211,21 @@ for epoch in range(num_epochs):
         # log
         if bidx%10==0:
             global_step = epoch * len(loader) + bidx
+
+            resolution_score = 0.0
+            self_attn_mean = 0.0
+
+            # --- Diagnostic logging ---
+            if hasattr(model, 'resolution_score') and model.resolution_score is not None:
+                resolution_score = model.resolution_score
+
+            if hasattr(model, 'attention_trajectory') and model.attention_trajectory:
+                # For now, track only the final step's mean attention to [SELF] token
+                last_attn = model.attention_trajectory[-1]  # (B, T, T)
+                # take the [SELF] token at position 0 → query idx 0, key idx 0
+                self_attn_mean = last_attn[:, 0, 0].mean().item()
+
+
 
             if (resonant_token_count + dynamic_resonant_token_count) == 0:
                 val_ri = 0.0
@@ -229,9 +250,10 @@ for epoch in range(num_epochs):
                 'rs':val_rs,
                 'surprisal_reward':val_sr,
                 'attention_kl':val_akl,
-                'resolution_reward':val_rr
+                'resolution_score':resolution_score,
+                'self_attn_mean':self_attn_mean
             }, step=global_step)
-            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {val_rr:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f}")
+            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f}")
 
 # Save final state
 state = {
