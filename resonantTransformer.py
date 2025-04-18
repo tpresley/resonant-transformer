@@ -1,4 +1,4 @@
-# resonantTransformer.py (fixed to align batch_first and return attention weights)
+# resonantTransformer.py (with custom encoder layer returning attention weights)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +33,27 @@ class ResonantController(nn.Module):
         out = F.layer_norm(out, (self.d_model,))
         return out
 
+# Custom encoder layer forcing attention weights return
+class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        """
+        Override to get attention weights.
+        """
+        # MultiheadAttention returns (output, weights) when need_weights=True
+        src2, attn_weights = self.self_attn(
+            src, src, src,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=True,
+            average_attn_weights=True
+        )
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src, attn_weights
+
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
                  resonant_token_count=0, dynamic_resonant_token_count=0,
@@ -53,14 +74,15 @@ class EnhancedResonantTransformer(nn.Module):
             self.resonator = MultiHeadResonance(num_heads=num_heads,
                                                 res_tokens=resonant_token_count,
                                                 d_model=d_model)
-        # Use batch_first=True so inputs are (batch, seq, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, num_heads,
+        # Build encoder with custom layers
+        layers = [CustomTransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
             dim_feedforward=512,
             dropout=0.1,
             batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        ) for _ in range(num_layers)]
+        self.encoder_layers = nn.ModuleList(layers)
         self.output = nn.Linear(d_model, vocab_size)
 
     def forward(self, x, context=None):
@@ -68,38 +90,36 @@ class EnhancedResonantTransformer(nn.Module):
         emb = self.embedding(x)  # (batch, seq, d_model)
         B = emb.size(0)
 
-        # build resonant tokens if any
-        res_tokens = []
+        # build resonant tokens
+        res_list = []
         if context is not None:
-            # context may be token ids or embeddings
             if context.dtype in (torch.int64, torch.int32):
                 ctx_emb = self.embedding(context)
             else:
                 ctx_emb = context
             context_vec = ctx_emb.mean(dim=1)
         if self.dynamic_resonant_token_count > 0 and context is not None:
-            dyn = self.controller(context_vec)
-            res_tokens.append(dyn)
+            res_list.append(self.controller(context_vec))
         if self.static_resonant_token_count > 0:
-            stat = self.resonant_tokens.expand(B, -1, -1)
-            res_tokens.append(stat)
-        if res_tokens:
-            tokens = torch.cat(res_tokens, dim=1)
-        else:
-            tokens = torch.empty(B, 0, self.d_model, device=emb.device)
+            res_list.append(self.resonant_tokens.expand(B, -1, -1))
+        tokens = torch.cat(res_list, dim=1) if res_list else torch.empty(B, 0, self.d_model, device=emb.device)
 
-        # retain grad on resonant tokens
+        # retain grad
         if self.training and tokens.numel() > 0 and tokens.requires_grad:
             tokens.retain_grad()
             self._res_tokens_for_ri = tokens
 
-        # concatenate and encode (batch_first)
+        # concat and encode
         inp = torch.cat([tokens.detach() * (1-self.alpha) + tokens * self.alpha, emb], dim=1)
-        # inp shape: (batch, res + seq, d_model)
-        encoded = self.encoder(inp)  # returns (batch, res+seq, d_model)
-        # strip off resonance prefix
-        out = encoded[:, tokens.size(1):, :]
-        logits = self.output(out)
+        attn_maps = []
+        out = inp
+        for layer in self.encoder_layers:
+            out, weights = layer(out)
+            attn_maps.append(weights)
+        # strip resonant prefix
+        seq_out = out[:, tokens.size(1):, :]
+        logits = self.output(seq_out)
+        # return logits plus collected attn_maps for hooks if desired
         return logits, tokens
 
 # Same utility functions as before
