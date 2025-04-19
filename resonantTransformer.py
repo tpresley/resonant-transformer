@@ -68,11 +68,9 @@ class EnhancedResonantTransformer(nn.Module):
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.token_scale = nn.Parameter(torch.tensor(1.0))
 
-
         if self.dynamic_resonant_token_count > 0:
             self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
         if self.static_resonant_token_count > 0:
-            # new: small‑scale init so fixed‑size grads make a bigger relative update
             self.resonant_tokens = nn.Parameter(
                 torch.randn(1, self.static_resonant_token_count, d_model) * 0.01
             )
@@ -90,7 +88,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.encoder_layers = nn.ModuleList(layers)
         self.output = nn.Linear(d_model, vocab_size)
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, update_global=True):
         emb = self.embedding(x)
         B = emb.size(0)
         self_tok = self.self_token.expand(B, -1, -1)
@@ -104,27 +102,27 @@ class EnhancedResonantTransformer(nn.Module):
                 ctx_emb = context
             context_vec = ctx_emb.mean(dim=1)
         elif self.global_res is not None:
-            # global_res shape: (1, T, D), so mean -> (1, D), expand to (B, D)
             context_vec = self.global_res.mean(dim=1).expand(x.size(0), -1).contiguous()
         else:
-            # [SELF] fallback — shape (1, 1, D), expand then mean -> (B, D)
             context_vec = self.self_token.expand(x.size(0), -1, -1).mean(dim=1)
 
+        # Gather resonant token sources
         res_list = []
         if self.static_resonant_token_count > 0:
-            # replicate static bank across the batch
             static = self.resonant_tokens.expand(B, -1, -1)
             res_list.append(static)
         if self.dynamic_resonant_token_count > 0:
-            # controller generates dynamic tokens from context
             dyn = self.controller(context_vec)
             res_list.append(dyn)
         if self.multihead:
-            # multi‑head mixture of static bank
             mh = self.resonator(context_vec)
             res_list.append(mh)
 
-        tokens = torch.cat(res_list, dim=1) * self.token_scale
+        # If no resonant tokens are configured, create an empty placeholder
+        if res_list:
+            tokens = torch.cat(res_list, dim=1) * self.token_scale
+        else:
+            tokens = torch.empty(B, 0, self.d_model, device=emb.device)
 
         if self.training and tokens.numel() > 0 and tokens.requires_grad:
             tokens.retain_grad()
@@ -137,59 +135,85 @@ class EnhancedResonantTransformer(nn.Module):
             out, weights = layer(out)
             attn_maps.append(weights)
 
+        # Extract sequence hidden states (excluding resonant tokens)
         seq_out = out[:, tokens.size(1):, :]
-        logits = self.output(seq_out)
+        hidden = seq_out
+        logits = self.output(hidden)
         res = tokens
 
-        # Update global_res using EMA
+        # Update global_res using EMA only if flagged
+        if update_global and res.numel() > 0:
+            momentum = 0.9
+            batch_mean_res = res.mean(dim=0, keepdim=True)  # (1, res_tokens, d_model)
+            if self.global_res is None:
+                self.global_res = batch_mean_res.detach()
+            else:
+                self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
+
+        return logits, res, attn_maps, hidden
+
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-2):
+        """
+        Recursive inference: update context per iteration so resonant tokens can evolve.
+        """
+        self.surprisal_trajectory.clear()
+        self.attention_trajectory.clear()
+
+        prev_res = None
+        prev_score = None
+        epsilon = 1e-3
+        current_context = context
+
+        if max_steps is None:
+            max_steps = self.max_recursive_steps
+
+        current_context = context
+        for step in range(max_steps):
+            # run forward but don’t update global_res; feed in current_context
+            logits, res, attn_maps, hidden = self.forward(x, current_context, update_global=False)
+            
+            # record trajectories
+            self.surprisal_trajectory.append(logits.detach())
+            if attn_maps:
+                self.attention_trajectory.append(attn_maps[-1].detach())
+
+            # compute resolution score
+            if len(self.surprisal_trajectory) > 1:
+                init = self.surprisal_trajectory[0]
+                final = self.surprisal_trajectory[-1]
+                self.resolution_score = (init - final).norm().item()
+                if prev_score is not None and abs(prev_score - self.resolution_score) < epsilon:
+                    break
+                prev_score = self.resolution_score
+
+            # check token convergence
+            if prev_res is not None:
+                delta = (res - prev_res).norm()
+                print(f"Recursive Delta: {delta:.12f}")
+                if delta < tol:
+                    break
+            prev_res = res.detach()
+
+            # update context for next iteration
+            current_context = hidden.detach()
+
+        self.last_recursive_steps = step + 1
+
+        # Single EMA update after recursion
         momentum = 0.9
-        batch_mean_res = res.mean(dim=0, keepdim=True)  # shape: (1, res_tokens, d_model)
+        batch_mean_res = res.mean(dim=0, keepdim=True)
         if self.global_res is None:
             self.global_res = batch_mean_res.detach()
         else:
             self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
-        return logits, res, attn_maps
-
-    def recursive_forward(self, x, max_steps=None, tol=1e-2):
-        self.surprisal_trajectory.clear()
-        self.attention_trajectory.clear()
-
-        prev_res = None
-        res = None
-        logits = None
-
-        prev_score = None
-        epsilon = 1e-3  # Resolution convergence threshold
-
-        if max_steps is None:
-            max_steps = self.max_recursive_steps
-
-        for step in range(max_steps):
-            logits, res, attn_maps = self.forward(x)
-
-            if logits is not None:
-                self.surprisal_trajectory.append(logits.detach())
-            if attn_maps:
-                self.attention_trajectory.append(attn_maps[-1].detach())
-
-            if len(self.surprisal_trajectory) > 1:
-                init = self.surprisal_trajectory[0]
-                final = self.surprisal_trajectory[-1]
-                self.resolution_score = (init - final).norm().item()
-
-                if prev_score is not None and abs(prev_score - self.resolution_score) < epsilon:
-                    break  # stop early due to semantic convergence
-
-                prev_score = self.resolution_score
-
-            if prev_res is not None and res is not None:
-                delta = (res - prev_res).norm()
-                if delta < tol:
-                    break
-            prev_res = res.detach()
-
-        self.last_recursive_steps = step + 1
+        if res.numel() > 0:
+            momentum = 0.9
+            batch_mean_res = res.mean(dim=0, keepdim=True)
+            if self.global_res is None:
+                self.global_res = batch_mean_res.detach()
+            else:
+                self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
         return logits, res
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):

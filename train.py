@@ -139,7 +139,7 @@ for epoch in range(num_epochs):
     for bidx,batch in enumerate(loader):
         inp = batch[:,:-1]; tgt = batch[:,1:]
         ctx = last_res if last_res is not None else inp
-        logits, res = model.recursive_forward(inp)
+        logits, res = model.recursive_forward(inp, ctx)
         steps = getattr(model, "last_recursive_steps", 0)
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)
@@ -200,7 +200,7 @@ for epoch in range(num_epochs):
         if not baseline:
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
-            coh, res, _ = model(ci, ci)
+            coh, res, _, _ = model(ci, ci)
             con = contrastive_loss(logits, coh)
             primary = primary + con
         else:
