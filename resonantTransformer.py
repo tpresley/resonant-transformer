@@ -66,11 +66,16 @@ class EnhancedResonantTransformer(nn.Module):
         self.d_model = d_model
         self.alpha = 0.0
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
+        self.token_scale = nn.Parameter(torch.tensor(1.0))
+
 
         if self.dynamic_resonant_token_count > 0:
             self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
         if self.static_resonant_token_count > 0:
-            self.resonant_tokens = nn.Parameter(torch.randn(1, self.static_resonant_token_count, d_model))
+            # new: small‑scale init so fixed‑size grads make a bigger relative update
+            self.resonant_tokens = nn.Parameter(
+                torch.randn(1, self.static_resonant_token_count, d_model) * 0.01
+            )
         if self.multihead:
             self.resonator = MultiHeadResonance(num_heads=num_heads,
                                                 res_tokens=resonant_token_count,
@@ -119,7 +124,7 @@ class EnhancedResonantTransformer(nn.Module):
             mh = self.resonator(context_vec)
             res_list.append(mh)
 
-        tokens = torch.cat(res_list, dim=1)
+        tokens = torch.cat(res_list, dim=1) * self.token_scale
 
         if self.training and tokens.numel() > 0 and tokens.requires_grad:
             tokens.retain_grad()
@@ -146,7 +151,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         return logits, res, attn_maps
 
-    def recursive_forward(self, x, max_steps=3, tol=1e-3):
+    def recursive_forward(self, x, max_steps=None, tol=1e-2):
         self.surprisal_trajectory.clear()
         self.attention_trajectory.clear()
 
@@ -157,9 +162,10 @@ class EnhancedResonantTransformer(nn.Module):
         prev_score = None
         epsilon = 1e-3  # Resolution convergence threshold
 
+        if max_steps is None:
+            max_steps = self.max_recursive_steps
+
         for step in range(max_steps):
-            if max_steps is None:
-                max_steps = self.max_recursive_steps
             logits, res, attn_maps = self.forward(x)
 
             if logits is not None:

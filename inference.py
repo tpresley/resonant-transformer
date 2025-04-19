@@ -53,6 +53,9 @@ if resonant_context is not None:
 
 model.load_state_dict(state["model_state_dict"])
 model.to(DEVICE)
+# Restore resonant memory so recursive_forward can actually use it
+if resonant_context is not None:
+    model.global_res = resonant_context.to(DEVICE)
 model.eval()
 
 # Inference loop
@@ -70,12 +73,15 @@ while True:
     generated = tokens[:sequence_length]
     with torch.no_grad():
         for _ in range(100):
-            input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long).unsqueeze(0).to(DEVICE)
-            logits = model.recursive_forward(input_seq)
-            probs = torch.softmax(logits[0, -1] / 1, dim=0)
+            input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long) \
+                                .unsqueeze(0).to(DEVICE)
+            # unpack properly:
+            logits, _ = model.recursive_forward(input_seq)
+            probs     = torch.softmax(logits[0, -1] / 1, dim=0)
             topk_probs, topk_indices = torch.topk(probs, 40)
             next_token = topk_indices[torch.multinomial(topk_probs, 1)].item()
             generated.append(next_token)
+
 
     output_text = tokenizer.decode(generated[len(tokens):], skip_special_tokens=True)
     output_text = output_text.replace("Ġ", " ").replace("@@", "").replace("â", "'").strip()

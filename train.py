@@ -108,7 +108,25 @@ avg_attn = None
 attn_momentum = 0.99
 
 # Optimizer & Criterion
-opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# in train.py, when you build the optimizer:
+token_learning_amplifier = 320
+opt = torch.optim.Adam([
+    # everything else
+    {'params': [p for n,p in model.named_parameters() if 'resonant_tokens' not in n
+                and 'controller' not in n and 'resonator' not in n],
+     'lr': learning_rate},
+    # static tokens
+    {'params': [model.resonant_tokens], 
+     'lr': learning_rate * token_learning_amplifier},
+    # dynamic tokens
+    {'params': model.controller.parameters(), 
+     'lr': learning_rate * token_learning_amplifier},
+    # if using multihead:
+    {'params': model.resonator.parameters(), 
+     'lr': learning_rate * token_learning_amplifier},
+])
+
 crit = nn.CrossEntropyLoss(ignore_index=pad_id)
 last_res=None
 
@@ -188,26 +206,99 @@ for epoch in range(num_epochs):
         else:
             con = torch.tensor(0.0, device=DEVICE)
 
-        # — RI/RS/diversity on the prefix tokens unchanged —
-        final = primary
-        ri_v = torch.tensor(0.0, device=DEVICE)
-        rs_v = torch.tensor(0.0, device=DEVICE)
+        # first build the final loss including these terms
+        term1 = term2 = 0.0
+        dvt   = torch.tensor(0.0, device=DEVICE)
         if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
-            gr = torch.autograd.grad(primary, model._res_tokens_for_ri,
-                                    retain_graph=True, create_graph=False,
-                                    allow_unused=True)[0]
-            if gr is not None:
-                gn     = gr.norm(-1).clamp(1e-6)
-                ri_v   = (gr * model._res_tokens_for_ri).sum(-1).abs() / gn
-                term1  = lambda_ri * ri_v.mean()
-                rs_v   = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-                term2  = lambda_rs * rs_v.mean()
-            else:
-                term1 = term2 = 0.0
-            dvt = lambda_div * diversity_penalty(model._res_tokens_for_ri)
-            final = primary - term1 - term2 + dvt
-        # Backprop
-        opt.zero_grad(); final.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+            # compute gradient w.r.t. the resonant tokens (may be None if unused)
+            grad_tuple = torch.autograd.grad(
+                primary, model._res_tokens_for_ri,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True
+            )
+            gr = grad_tuple[0]
+            if gr is None:
+                # no gradient flowed—use zeros
+                gr = torch.zeros_like(model._res_tokens_for_ri)
+            gn    = gr.norm(dim=-1).clamp(min=1e-6)
+            ri_v  = (gr * model._res_tokens_for_ri).sum(dim=-1).abs() / gn
+            term1 = lambda_ri * ri_v.mean()
+            rs_v  = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+            term2 = lambda_rs * rs_v.mean()
+            dvt   = lambda_div * diversity_penalty(model._res_tokens_for_ri)
+        final = primary - term1 - term2 + dvt
+
+        # Backprop the full loss
+        opt.zero_grad()
+        final.backward()
+
+        # NOW extract the _actual_ gradients on the resonant tokens
+        # — raw‐dot RI & standard RS (no grad‑norm division) —
+        gr = model._res_tokens_for_ri.grad       # (B, T, D)
+        # raw absolute dot ⇝ “influence” magnitude
+        ri_v     = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()   # (B, T)
+        # cosine penalty unchanged
+        rs_v     = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+        val_ri   = ri_v.mean().item()
+        val_rs   = rs_v.mean().item()
+        
+        cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+        val_cos_sim = cos_sim_v.mean().item()
+
+        
+        other_params = [p for n,p in model.named_parameters()
+                        if 'resonant_tokens' not in n
+                        and 'controller' not in n
+                        and 'resonator' not in n]
+        torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
+        opt.step()
+        # every 100 batches, give tokens 5 exclusive mini‑steps:
+        if bidx % 100 == 0 and (resonant_token_count + dynamic_resonant_token_count) > 0:
+            # 1) freeze all but token/controller/resonator params
+            for n, p in model.named_parameters():
+                p.requires_grad = any(k in n for k in
+                    ['resonant_tokens','controller','resonator'])
+
+            # 2) inner token‑only loop
+            for _ in range(5):
+
+                # recompute primary to get a fresh autograd graph
+                logits, res = model.recursive_forward(inp)
+                logits = logits[:, :inp.size(1), :]
+                primary_inner = crit(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt.reshape(-1)
+                )
+
+                # compute the gradient of that primary w.r.t. the tokens
+                grad_tuple = torch.autograd.grad(
+                    primary_inner,
+                    model._res_tokens_for_ri,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True
+                )
+                gr_inner = grad_tuple[0]
+                if gr_inner is None:
+                    gr_inner = torch.zeros_like(model._res_tokens_for_ri)
+
+                # now build the same RI/RS/div terms
+                ri_v_inner = (gr_inner * model._res_tokens_for_ri).sum(dim=-1).abs()
+                term1      = lambda_ri * ri_v_inner.mean()
+                rs_v_inner = 1 - F.cosine_similarity(gr_inner, model._res_tokens_for_ri, dim=-1)
+                term2      = lambda_rs * rs_v_inner.mean()
+                dvt        = lambda_div * diversity_penalty(model._res_tokens_for_ri)
+
+                token_loss = term1 + term2 + dvt
+                opt.zero_grad()
+                token_loss.backward()
+                opt.step()
+
+            # 3) unfreeze everything
+            for p in model.parameters():
+                p.requires_grad_(True)
+
         # update
         last_res = getattr(model,'_res_tokens_for_ri',None)
         if last_res is not None: last_res=last_res.detach()
@@ -242,22 +333,23 @@ for epoch in range(num_epochs):
                 val_akl = 0.0
                 val_rr = 0.0
             else:
-                val_sr = sur.item()
+                val_sr = sur_reward.item()
                 val_akl = akl.item()
-                val_rr = rr.item()
+                val_rr = res_reward.item()
 
             wandb.log({
                 'loss':final.item(),
                 'perplexity':float(np.exp(final.item())),
                 'ri':val_ri,
                 'rs':val_rs,
+                'rs_cos':val_cos_sim,
                 'surprisal_reward':val_sr,
                 'attention_kl':val_akl,
                 'resolution_score':resolution_score,
                 'self_attn_mean':self_attn_mean,
                 'recursive_steps':steps
             }, step=global_step)
-            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.2f} | RS: {val_rs:.2f} | STEPS: {steps}")
+            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.6f} | RSC: {val_cos_sim:.6f} | STEPS: {steps}")
 
 # Save final state
 state = {

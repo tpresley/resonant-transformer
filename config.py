@@ -7,7 +7,7 @@
 baseline=False
 
 d_model = 512
-num_heads = 2
+num_heads = 4
 num_layers = 4
 sequence_length = 384
 max_tokens = 2000000
@@ -21,25 +21,25 @@ num_epochs = 50
 #####
 
 # Number of Static Resonant Tokens (zero to disable)
-resonant_token_count = 4
+resonant_token_count = 16
 # Number of Dynamic Resonant Tokens to use (zero to disable)
-dynamic_resonant_token_count = 4
+dynamic_resonant_token_count = 16
 # How many epochs in the beginning to prevent Resonant Tokens
 # from influencing model weights (helps prevent collapse from early misalignment)
-warmup_epochs = 5
+warmup_epochs = 0
 # Scalar controlling how strongly resonant tokens are optimized to align with
 # their gradients (acts like a targeted learning rate for participation)
-lambda_ri = 0.01
+lambda_ri = 96
 # Weight for penalizing angular misalignment between resonant tokens and their gradients
 # (discourages semantic drift)
 # lower value gives tokens more "creativity", but risks model collapse
-lambda_rs = 0.01
+lambda_rs = 0.0
 # Weight for penalizing redundancy among resonant tokens (encourages diversity in their representations)
-lambda_div = 0.1
+lambda_div = 0.000005
 
-lambda_sur = 0.1      # surprisal-drop weight
-lambda_attn = 0.1     # attention-divergence weight
-lambda_res = 0.02      # resolution-coherence weight
+lambda_sur = 0.005      # surprisal-drop weight
+lambda_attn = 0.05     # attention-divergence weight
+lambda_res = 0.001      # resolution-coherence weight
 
-multihead_resonance = False  # boolean flag for multihead resonance
-max_recursive_steps = 3
+multihead_resonance = True  # boolean flag for multihead resonance
+max_recursive_steps = 5
