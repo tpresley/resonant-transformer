@@ -26,7 +26,7 @@ class MultiHeadResonance(nn.Module):
     def __init__(self, num_heads, res_tokens, d_model):
         super().__init__()
         self.resonant_bank = nn.Parameter(torch.randn(num_heads, res_tokens, d_model))
-        self.selector = nn.Linear(d_model, num_heads)
+        self.selector = LawfulLinear(d_model, num_heads)
         self.num_heads = num_heads
         self.res_tokens = res_tokens
         self.d_model = d_model
@@ -48,7 +48,7 @@ class MultiHeadResonance(nn.Module):
 class ResonantController(nn.Module):
     def __init__(self, d_model, res_tokens):
         super().__init__()
-        self.linear = nn.Linear(d_model, res_tokens * d_model)
+        self.linear = LawfulLinear(d_model, res_tokens * d_model)
         self.res_tokens = res_tokens
         self.d_model = d_model
 
@@ -71,17 +71,17 @@ class CustomTransformerEncoderLayer(nn.Module):
         self.head_dim = d_model // nhead
         assert d_model % nhead == 0
 
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = LawfulLinear(d_model, d_model)
+        self.k_proj = LawfulLinear(d_model, d_model)
+        self.v_proj = LawfulLinear(d_model, d_model)
+        self.out_proj = LawfulLinear(d_model, d_model)
 
         self.dropout = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear1 = LawfulLinear(d_model, dim_feedforward)
+        self.linear2 = LawfulLinear(dim_feedforward, d_model)
         self.activation = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -162,7 +162,7 @@ class EnhancedResonantTransformer(nn.Module):
             dropout=0.1
         ) for _ in range(num_layers)]
         self.encoder_layers = nn.ModuleList(layers)
-        self.output = nn.Linear(d_model, vocab_size)
+        self.output = LawfulLinear(d_model, vocab_size)
 
     def forward(self, x, context=None, update_global=True):
         emb = self.embedding(x)
@@ -323,14 +323,42 @@ class SelfModel(nn.Module):
         super().__init__()
         self.depth = depth
         self.linear = nn.Sequential(
-            nn.Linear(hidden_size * depth, hidden_size),  # <-- update this line
+            LawfulLinear(hidden_size * depth, hidden_size),  # <-- update this line
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
+            LawfulLinear(hidden_size, hidden_size)
         )
 
     def forward(self, past_states):  # shape: (batch, depth, hidden)
         x = past_states.reshape(past_states.size(0), -1)  # flatten depth × hidden
         return self.linear(x)
+
+
+class LawfulLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        # Frozen weights (pretrained or randomly initialized)
+        self.weight_base = nn.Parameter(torch.empty(out_features, in_features), requires_grad=False)
+        self.bias_base = nn.Parameter(torch.empty(out_features), requires_grad=False) if bias else None
+
+        # Learnable delta (lawful recursive updates)
+        self.delta_weight = nn.Parameter(torch.zeros(out_features, in_features))
+        self.delta_bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+
+        self.raf_modulation = 1.0  # default, updated externally per step
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight_base, a=5 ** 0.5)
+        if self.bias_base is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight_base)
+            bound = 1 / fan_in ** 0.5
+            nn.init.uniform_(self.bias_base, -bound, bound)
+
+    def forward(self, x):
+        weight = self.weight_base + self.delta_weight * self.raf_modulation
+        bias = self.bias_base + self.delta_bias * self.raf_modulation if self.bias_base is not None else None
+        return nn.functional.linear(x, weight, bias)
 
 
 
@@ -357,3 +385,11 @@ def cosine_rampup(t, warmup_epochs):
     if t >= warmup_epochs:
         return 1.0
     return 0.5 * (1 - torch.cos(torch.tensor(torch.pi * t / warmup_epochs)))
+
+def compute_recursive_flux(entropy_deltas, attn_kls):
+    # You can later weight these by importance
+    return entropy_deltas.mean(dim=-1) + attn_kls.mean(dim=-1)
+
+def compute_modulation_signal(recursive_flux, threshold=0.5):
+    # Sigmoid-like scaling between 0 and 1
+    return torch.tanh((recursive_flux - threshold) * 5.0).clamp(0.0, 1.0)
