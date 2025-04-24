@@ -195,7 +195,9 @@ class EnhancedResonantTransformer(nn.Module):
             #     for i, t in enumerate(res_list):
             #         print(f"Token source {i} norm: {t.norm().item():.4f}")
             #     print(f"Token scale: {self.token_scale.item():.4f}")
-            tokens = torch.cat(res_list, dim=1) * self.token_scale
+            safe_scale = self.token_scale.clamp(min=1.0, max=3.0)
+            tokens = torch.cat(res_list, dim=1) * safe_scale
+
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
 
@@ -224,10 +226,6 @@ class EnhancedResonantTransformer(nn.Module):
                 self.global_res = batch_mean_res.detach()
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
-
-        with torch.no_grad():
-            clamped = self.token_scale.clamp(min=1.0, max=3.0)
-            self.token_scale.copy_(clamped)
 
         return logits, res, attn_maps, hidden
 
