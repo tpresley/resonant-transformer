@@ -28,7 +28,8 @@ from config import (
     lambda_sur, lambda_attn, lambda_res,
     multihead_resonance,
     max_recursive_steps,
-    recursive_convergence_tolerance
+    recursive_convergence_tolerance,
+    self_model_hidden_dim
 )
 
 if baseline:
@@ -49,7 +50,8 @@ wandb.init(project="resonant-transformer-RoPE2", name=run_name, config={
     **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
         'd_model','num_heads','num_layers','resonant_token_count',
         'dynamic_resonant_token_count','learning_rate','batch_size',
-        'num_epochs','sequence_length','max_tokens','multihead_resonance'
+        'num_epochs','sequence_length','max_tokens','multihead_resonance',
+        'recursive_convergence_tolerance', 'self_model_hidden_dim'
     ]}
 })
 
@@ -107,7 +109,8 @@ model = EnhancedResonantTransformer(
     resonant_token_count = resonant_token_count,
     dynamic_resonant_token_count = dynamic_resonant_token_count,
     multihead = multihead_resonance,
-    max_recursive_steps = max_recursive_steps
+    max_recursive_steps = max_recursive_steps,
+    hidden_dim=self_model_hidden_dim
 ).to(DEVICE)
 model.train()
 
@@ -465,7 +468,7 @@ for epoch in range(num_epochs):
                 'self_attn_mean':self_attn_mean,
                 'recursive_steps':steps
             }, step=global_step)
-            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.6f} | RSC: {val_cos_sim:.6f} | STEPS: {steps}")
+            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | STEPS: {steps}")
 
     # === Save checkpoint at end of this epoch ===
     if (epoch + 1) % 10 == 0:
@@ -486,7 +489,9 @@ for epoch in range(num_epochs):
                 'warmup_epochs': warmup_epochs,
                 'resonant_token_count': resonant_token_count,
                 'dynamic_resonant_token_count': dynamic_resonant_token_count,
-                'multihead': multihead_resonance
+                'multihead': multihead_resonance,
+                'recursive_convergence_tolerance': recursive_convergence_tolerance,
+                'self_model_hidden_dim': self_model_hidden_dim
             },
             'final_resonant_state': getattr(model, '_res_tokens_for_ri', None)
         }
@@ -511,7 +516,9 @@ state = {
         'warmup_epochs': warmup_epochs,
         'resonant_token_count': resonant_token_count,
         'dynamic_resonant_token_count': dynamic_resonant_token_count,
-        'multihead': multihead_resonance
+        'multihead': multihead_resonance,
+        'recursive_convergence_tolerance': recursive_convergence_tolerance,
+        'self_model_hidden_dim': self_model_hidden_dim
     },
     'final_resonant_state': last_res
 }

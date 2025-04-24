@@ -4,7 +4,7 @@ from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from resonantTransformer import EnhancedResonantTransformer
 
-from config import recursive_convergence_tolerance
+from config import recursive_convergence_tolerance, baseline
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

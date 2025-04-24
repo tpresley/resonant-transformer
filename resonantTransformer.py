@@ -123,6 +123,7 @@ class CustomTransformerEncoderLayer(nn.Module):
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
                  resonant_token_count=0, dynamic_resonant_token_count=0,
+                 hidden_dim=128,
                  multihead=False,
                  max_recursive_steps: int = 3):
         super().__init__()
@@ -140,7 +141,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.token_scale = nn.Parameter(torch.tensor(1.0))
         # Self-model for recursive state prediction
-        self.self_model = SelfModel(hidden_size=self.hidden_size, depth=3)
+        self.self_model = SelfModel(hidden_size=self.d_model, depth=3)
         self.self_model_loss_fn = nn.MSELoss()
 
 
@@ -322,14 +323,15 @@ class SelfModel(nn.Module):
         super().__init__()
         self.depth = depth
         self.linear = nn.Sequential(
-            nn.Linear(hidden_size * depth, hidden_size),
+            nn.Linear(hidden_size * depth, hidden_size),  # <-- update this line
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size)
         )
 
     def forward(self, past_states):  # shape: (batch, depth, hidden)
-        x = past_states.reshape(past_states.size(0), -1)
+        x = past_states.reshape(past_states.size(0), -1)  # flatten depth × hidden
         return self.linear(x)
+
 
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):
