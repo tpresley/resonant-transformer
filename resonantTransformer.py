@@ -53,6 +53,9 @@ class ResonantController(nn.Module):
         self.d_model = d_model
 
     def forward(self, context_embedding):
+        assert context_embedding.shape[-1] == self.d_model, (
+            f"Expected input dim {self.d_model}, got {context_embedding.shape[-1]}"
+        )
         if self.res_tokens == 0:
             return torch.empty(context_embedding.size(0), 0, self.d_model, device=context_embedding.device)
         if context_embedding.dim() == 1:
@@ -143,6 +146,7 @@ class EnhancedResonantTransformer(nn.Module):
         # Self-model for recursive state prediction
         self.self_model = SelfModel(hidden_size=self.d_model, depth=3)
         self.self_model_loss_fn = nn.MSELoss()
+        self._res_tokens_for_ri = None
 
 
         if self.dynamic_resonant_token_count > 0:
@@ -170,17 +174,27 @@ class EnhancedResonantTransformer(nn.Module):
         self_tok = self.self_token.expand(B, -1, -1)
         emb = torch.cat([self_tok, emb], dim=1)
 
-        # Compute context vector
+        # === Derive context vector ===
         if context is not None:
             if context.dtype in (torch.int64, torch.int32):
-                ctx_emb = self.embedding(context)
+                ctx_emb = self.embedding(context)  # [B, L, D]
+                context_vec = ctx_emb.mean(dim=1)  # [B, D]
+            elif context.dim() == 2:
+                # Already [B, D], use directly
+                context_vec = context
+            elif context.dim() == 3:
+                context_vec = context.mean(dim=1)  # [B, D]
             else:
-                ctx_emb = context
-            context_vec = ctx_emb.mean(dim=1)
-        elif self.global_res is not None:
-            context_vec = self.global_res.mean(dim=1).expand(x.size(0), -1).contiguous()
+                raise ValueError(f"[forward] Unsupported context shape: {context.shape}")
         else:
-            context_vec = self.self_token.expand(x.size(0), -1, -1).mean(dim=1)
+            if self.global_res is not None:
+                context_vec = self.global_res.mean(dim=1).expand(x.size(0), -1).contiguous()  # [B, D]
+            else:
+                context_vec = self.self_token.expand(x.size(0), -1, -1).mean(dim=1)  # [B, D]
+
+        # Assert safety
+        assert context_vec.shape[-1] == self.d_model, f"context_vec has invalid last dim: {context_vec.shape[-1]}"
+
 
         # Gather resonant token sources
         res_list = []
@@ -206,11 +220,17 @@ class EnhancedResonantTransformer(nn.Module):
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
 
-        if self.training and tokens.numel() > 0 and tokens.requires_grad:
-            tokens.retain_grad()
+        if tokens.numel() > 0:
             self._res_tokens_for_ri = tokens
+            if tokens.requires_grad:
+                tokens.retain_grad()
 
-        inp = torch.cat([tokens.detach() * (1 - self.alpha) + tokens * self.alpha, emb], dim=1)
+        if self.training:
+            blended_tokens = tokens.detach() * (1 - self.alpha) + tokens * self.alpha
+        else:
+            blended_tokens = tokens  # preserve full gradient path in eval/inference
+
+        inp = torch.cat([blended_tokens, emb], dim=1)
         attn_maps = []
         out = inp
         for layer in self.encoder_layers:
@@ -232,83 +252,132 @@ class EnhancedResonantTransformer(nn.Module):
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
-        return logits, res, attn_maps, hidden
+        return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
     def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5):
         """
-        Recursive inference: update context per iteration so resonant tokens can evolve.
+        Full recursive inference with:
+        - entropy / resolution / attention tracking
+        - self-modeling loss
+        - RAF modulation
+        - adaptive early halting (via tolerance)
         """
+        training_was_enabled = self.training
+        self.eval()
+
         self.surprisal_trajectory.clear()
         self.attention_trajectory.clear()
 
-        prev_res = None
-        prev_score = None
-        epsilon = 1e-2
-        current_context = context
+        num_steps = max_steps if max_steps is not None else self.max_recursive_steps
+        ema_decay = 0.9  # controls smoothing; higher = slower update
 
-        if max_steps is None:
-            max_steps = self.max_recursive_steps
-
-        current_context = context
+        entropy_deltas = []
+        attention_kls = []
+        resolution_scores = []
         past_internal_states = []
-        for step in range(max_steps):
-            # run forward but don’t update global_res; feed in current_context
-            logits, res, attn_maps, hidden = self.forward(x, current_context, update_global=False)
 
-            # record scalar summaries instead of full tensors
-            self.surprisal_trajectory.append(logits.detach().norm().item())
+        previous_entropy = None
+        previous_attention = None
+        previous_resolution = None
+
+        logits = None
+        hidden = None
+        res = None
+        attn_maps = None
+
+        for step in range(num_steps):
+            logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False)
+
+
+            # === Entropy / surprisal tracking ===
+            probs = torch.softmax(logits, dim=-1)
+            entropy = -(probs * probs.log()).sum(dim=-1).mean()
+            self.surprisal_trajectory.append(entropy.item())
+
+            if previous_entropy is not None:
+                entropy_deltas.append((entropy - previous_entropy).abs())
+            previous_entropy = entropy
+
+            # === Attention KL divergence ===
+            if previous_attention is not None and attn_maps:
+                current_attn = attn_maps[-1]
+                kl = torch.nn.functional.kl_div(
+                    torch.log_softmax(current_attn, dim=-1),
+                    torch.softmax(previous_attention, dim=-1),
+                    reduction='batchmean'
+                )
+                attention_kls.append(kl)
             if attn_maps:
-                self.attention_trajectory.append(attn_maps[-1].detach().mean().item())
+                previous_attention = attn_maps[-1]
 
-            # compute resolution score
-            if len(self.surprisal_trajectory) > 1:
-                init = self.surprisal_trajectory[0]
-                final = self.surprisal_trajectory[-1]
-                # simple absolute difference for scalar logs
-                self.resolution_score = abs(init - final)
-                if prev_score is not None and abs(prev_score - self.resolution_score) < epsilon:
-                    break
-                prev_score = self.resolution_score
-
-            # check token convergence
-            if prev_res is not None:
-                delta = (res - prev_res).norm()
+            # === Resolution score tracking ===
+            res_norms = res.norm(dim=-1)  # (batch, token_count)
+            resolution_score = res_norms.mean()
+            resolution_scores.append(resolution_score)
+            # —– convergence check on raw res —–
+            if previous_resolution is None:
+                previous_resolution = res.detach()
+            else:
+                # mean L2‐distance across all tokens
+                delta = (res - previous_resolution).norm(dim=-1).mean().item()
                 if delta < tol:
+                    print(f"Converged early at step {step}: Δres={delta:.2e} < tol={tol}")
                     break
-            prev_res = res.detach()
+                previous_resolution = res.detach()
 
-            # update context for next iteration
-            current_context = hidden.detach()
-
-            hidden_state_t = hidden[:, 0, :]  # track first token (position 0) as representative
-            past_internal_states.append(hidden_state_t.detach())
+            # === Hidden state for self-modeling ===
+            past_internal_states.append(hidden[:, 0, :].detach())
             if len(past_internal_states) > self.self_model.depth:
                 past_internal_states.pop(0)
 
+            # === Update context_vec via EMA ===
+            res_tokens_only = full_out[:, :res.size(1), :].detach()  # [B, R, D]
+            new_context_vec = res_tokens_only.mean(dim=1)  # [B, D]
 
+            if context is not None:
+                if context.dtype in (torch.int64, torch.int32):
+                    ctx_emb = self.embedding(context)
+                    old_context_vec = ctx_emb.mean(dim=1)  # [B, D]
+                elif context.dim() == 2:
+                    old_context_vec = context  # already [B, D]
+                elif context.dim() == 3:
+                    old_context_vec = context.mean(dim=1)  # [B, D]
+                else:
+                    raise ValueError(f"[recursive_forward] Unsupported context shape: {context.shape}")
+            else:
+                old_context_vec = new_context_vec
+
+            context_vec_ema = ema_decay * old_context_vec + (1 - ema_decay) * new_context_vec
+            context = context_vec_ema.detach()  # Update for next step
+
+            # Assert
+            assert context.shape[-1] == self.d_model, f"Context shape mismatch: expected {self.d_model}, got {context.shape}"
+
+
+
+        # === Self-model prediction and loss ===
         if len(past_internal_states) == self.self_model.depth:
-            past_tensor = torch.stack(past_internal_states, dim=1)  # shape: (batch, depth, hidden)
+            past_tensor = torch.stack(past_internal_states, dim=1)  # (batch, depth, hidden)
             predicted_next = self.self_model(past_tensor)
-            target_next = hidden[:, 0, :].detach()  # final real internal state
+            target_next = hidden[:, 0, :].detach()
             self_model_loss = self.self_model_loss_fn(predicted_next, target_next)
         else:
             self_model_loss = torch.tensor(0.0, device=hidden.device)
-
         self.last_self_model_loss = self_model_loss
 
+        self.last_recursive_steps = step + 1
 
-        # Store it on self for training access
-        self.last_self_model_loss = self_model_loss
+        # === RAF modulation from recursive flux ===
+        if entropy_deltas and attention_kls:
+            recursive_flux = torch.stack(entropy_deltas).mean() + torch.stack(attention_kls).mean()
+            modulation_signal = compute_modulation_signal(recursive_flux)
 
-        # Single EMA update after recursion
-        momentum = 0.9
-        batch_mean_res = res.mean(dim=0, keepdim=True)
-        if self.global_res is None:
-            self.global_res = batch_mean_res.detach()
-        else:
-            self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
+            for module in self.modules():
+                if isinstance(module, LawfulLinear):
+                    module.raf_modulation = modulation_signal.item()
 
-        if res.numel() > 0:
+        # === Global resonant token update ===
+        if res is not None and res.numel() > 0:
             momentum = 0.9
             batch_mean_res = res.mean(dim=0, keepdim=True)
             if self.global_res is None:
@@ -316,7 +385,12 @@ class EnhancedResonantTransformer(nn.Module):
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
-        return logits, res
+        if training_was_enabled:
+            self.train()        
+        
+        return logits, hidden
+
+
 
 class SelfModel(nn.Module):
     def __init__(self, hidden_size, depth=3):
@@ -344,7 +418,7 @@ class LawfulLinear(nn.Module):
         self.delta_weight = nn.Parameter(torch.zeros(out_features, in_features))
         self.delta_bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
-        self.raf_modulation = 1.0  # default, updated externally per step
+        self.raf_modulation = 1.0  # Default modulation factor
 
         self.reset_parameters()
 
@@ -391,5 +465,6 @@ def compute_recursive_flux(entropy_deltas, attn_kls):
     return entropy_deltas.mean(dim=-1) + attn_kls.mean(dim=-1)
 
 def compute_modulation_signal(recursive_flux, threshold=0.5):
-    # Sigmoid-like scaling between 0 and 1
+    # Sigmoid-shaped scaling function
     return torch.tanh((recursive_flux - threshold) * 5.0).clamp(0.0, 1.0)
+

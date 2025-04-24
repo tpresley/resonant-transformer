@@ -26,7 +26,7 @@ resonant_token_count = 4
 dynamic_resonant_token_count = 4
 # How many epochs in the beginning to prevent Resonant Tokens
 # from influencing model weights (helps prevent collapse from early misalignment)
-warmup_epochs = 1
+warmup_epochs = 0
 # Multiple over the standard model learning to amplify learning in reonant tokens
 token_learning_amplifier = 5
 # Scalar controlling how strongly resonant tokens are optimized to align with
@@ -45,5 +45,5 @@ lambda_res = 0.05      # resolution-coherence weight
 
 multihead_resonance = True  # boolean flag for multihead resonance
 max_recursive_steps = 5
-recursive_convergence_tolerance = 1e-3
+recursive_convergence_tolerance = 1e-5
 self_model_hidden_dim = 128

@@ -321,13 +321,20 @@ for epoch in range(num_epochs):
         if not baseline:
             # NOW extract the _actual_ gradients on the resonant tokens
             # — raw‐dot RI & standard RS (no grad‑norm division) —
-            gr = model._res_tokens_for_ri.grad       # (B, T, D)
-            # raw absolute dot ⇝ “influence” magnitude
-            ri_v     = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()   # (B, T)
-            # cosine penalty unchanged
-            rs_v     = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-            val_ri   = ri_v.mean().item()
-            val_rs   = rs_v.mean().item()
+            if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.grad is not None:
+                gr = model._res_tokens_for_ri.grad  # (B, T, D)
+                # raw absolute dot ⇝ “influence” magnitude
+                ri_v = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()
+                rs_v = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+                val_ri = ri_v.mean().item()
+                val_rs = rs_v.mean().item()
+                cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+                val_cos_sim = cos_sim_v.mean().item()
+            else:
+                val_ri = 0.0
+                val_rs = 0.0
+                val_cos_sim = 0.0
+
             
             cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
             val_cos_sim = cos_sim_v.mean().item()
