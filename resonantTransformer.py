@@ -1,6 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+def apply_rope(q, k, seq_dim=1):
+    """
+    Applies rotary positional embedding to query and key tensors.
+    Assumes input shapes [B, L, H, D] or [L, B, H, D] depending on usage.
+    """
+    d = q.size(-1)
+    half = d // 2
+    freqs = torch.exp(-torch.arange(0, half, dtype=torch.float32, device=q.device) * (math.log(10000.0) / half))
+    pos = torch.arange(q.size(seq_dim), device=q.device, dtype=torch.float32)
+    sinusoid = torch.einsum("l,d->ld", pos, freqs)
+    sin = sinusoid.sin()[None, :, None, :]
+    cos = sinusoid.cos()[None, :, None, :]
+
+    def rotate(t):
+        t1, t2 = t[..., :half], t[..., half:]
+        return torch.cat([t1 * cos - t2 * sin, t2 * cos + t1 * sin], dim=-1)
+
+    return rotate(q), rotate(k)
 
 class MultiHeadResonance(nn.Module):
     def __init__(self, num_heads, res_tokens, d_model):
@@ -12,9 +32,18 @@ class MultiHeadResonance(nn.Module):
         self.d_model = d_model
 
     def forward(self, context_vec):
-        weights = torch.softmax(self.selector(context_vec), dim=-1)
-        weighted_tokens = torch.einsum('bh,hnd->bnd', weights, self.resonant_bank)
-        return weighted_tokens
+        weights = torch.softmax(self.selector(context_vec), dim=-1)  # shape: [B, H]
+        weighted_tokens = torch.einsum('bh,hnd->bnd', weights, self.resonant_bank)  # [B, N, D]
+
+        # Normalize each token vector (across the feature dimension)
+        normed = F.normalize(weighted_tokens, dim=-1)  # ensures unit-norm per token
+        # if self.training:
+        #     print("Multihead output norm (per token):", normed.norm(dim=-1).mean().item())
+
+        # Optional: Scale each token to a desired magnitude (e.g., 1.0)
+        scaled = normed * 0.5
+
+        return scaled  # shape: [B, N, D]
 
 class ResonantController(nn.Module):
     def __init__(self, d_model, res_tokens):
@@ -30,23 +59,66 @@ class ResonantController(nn.Module):
             context_embedding = context_embedding.unsqueeze(0)
         out = self.linear(context_embedding).view(-1, self.res_tokens, self.d_model)
         out = F.layer_norm(out, (self.d_model,))
+        out = F.normalize(out, dim=-1) * 0.5  # target norm = 1.0 per token
         return out
 
-class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
+
+class CustomTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        src2, attn_weights = self.self_attn(
-            src, src, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            need_weights=True,
-            average_attn_weights=True
-        )
+        B, L, D = src.size()
+        H = self.nhead
+        Dh = self.head_dim
+
+        q = self.q_proj(src).view(B, L, H, Dh).transpose(1, 2)  # [B, H, L, Dh]
+        k = self.k_proj(src).view(B, L, H, Dh).transpose(1, 2)
+        v = self.v_proj(src).view(B, L, H, Dh).transpose(1, 2)
+
+        # === RoPE here ===
+        q, k = apply_rope(q, k)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(Dh)  # [B, H, L, L]
+        if src_mask is not None:
+            attn_scores += src_mask.unsqueeze(1)
+        if src_key_padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(
+                src_key_padding_mask.unsqueeze(1).unsqueeze(2),
+                float('-inf')
+            )
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_output = torch.matmul(self.dropout(attn_weights), v)  # [B, H, L, Dh]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, D)  # [B, L, D]
+
+        src2 = self.out_proj(attn_output)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        src = src + src2
         src = self.norm2(src)
-        return src, attn_weights
+        return src, attn_weights.mean(dim=1)  # average heads
+
 
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
@@ -82,8 +154,7 @@ class EnhancedResonantTransformer(nn.Module):
             d_model=d_model,
             nhead=num_heads,
             dim_feedforward=512,
-            dropout=0.1,
-            batch_first=True
+            dropout=0.1
         ) for _ in range(num_layers)]
         self.encoder_layers = nn.ModuleList(layers)
         self.output = nn.Linear(d_model, vocab_size)
@@ -120,6 +191,10 @@ class EnhancedResonantTransformer(nn.Module):
 
         # If no resonant tokens are configured, create an empty placeholder
         if res_list:
+            # if self.training:
+            #     for i, t in enumerate(res_list):
+            #         print(f"Token source {i} norm: {t.norm().item():.4f}")
+            #     print(f"Token scale: {self.token_scale.item():.4f}")
             tokens = torch.cat(res_list, dim=1) * self.token_scale
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
@@ -150,9 +225,13 @@ class EnhancedResonantTransformer(nn.Module):
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
+        with torch.no_grad():
+            clamped = self.token_scale.clamp(min=1.0, max=3.0)
+            self.token_scale.copy_(clamped)
+
         return logits, res, attn_maps, hidden
 
-    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-2):
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5):
         """
         Recursive inference: update context per iteration so resonant tokens can evolve.
         """
@@ -161,7 +240,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         prev_res = None
         prev_score = None
-        epsilon = 1e-3
+        epsilon = 1e-2
         current_context = context
 
         if max_steps is None:
@@ -172,16 +251,17 @@ class EnhancedResonantTransformer(nn.Module):
             # run forward but don’t update global_res; feed in current_context
             logits, res, attn_maps, hidden = self.forward(x, current_context, update_global=False)
             
-            # record trajectories
-            self.surprisal_trajectory.append(logits.detach())
+            # record scalar summaries instead of full tensors
+            self.surprisal_trajectory.append(logits.detach().norm().item())
             if attn_maps:
-                self.attention_trajectory.append(attn_maps[-1].detach())
+                self.attention_trajectory.append(attn_maps[-1].detach().mean().item())
 
             # compute resolution score
             if len(self.surprisal_trajectory) > 1:
                 init = self.surprisal_trajectory[0]
                 final = self.surprisal_trajectory[-1]
-                self.resolution_score = (init - final).norm().item()
+                # simple absolute difference for scalar logs
+                self.resolution_score = abs(init - final)
                 if prev_score is not None and abs(prev_score - self.resolution_score) < epsilon:
                     break
                 prev_score = self.resolution_score
@@ -189,7 +269,6 @@ class EnhancedResonantTransformer(nn.Module):
             # check token convergence
             if prev_res is not None:
                 delta = (res - prev_res).norm()
-                print(f"Recursive Delta: {delta:.12f}")
                 if delta < tol:
                     break
             prev_res = res.detach()

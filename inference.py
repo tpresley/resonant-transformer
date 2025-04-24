@@ -4,6 +4,8 @@ from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from resonantTransformer import EnhancedResonantTransformer
 
+from config import recursive_convergence_tolerance
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # List .pt files
@@ -38,6 +40,7 @@ sequence_length = model_config["sequence_length"]  # Can be inferred/stored if d
 
 # Instantiate model using saved config
 model = EnhancedResonantTransformer(
+    # baseline=model_config["baseline"],
     vocab_size=model_config["vocab_size"],
     d_model=model_config["d_model"],
     num_heads=model_config["num_heads"],
@@ -75,11 +78,32 @@ while True:
         for _ in range(100):
             input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long) \
                                 .unsqueeze(0).to(DEVICE)
-            # unpack properly:
-            logits, _ = model.recursive_forward(input_seq)
-            probs     = torch.softmax(logits[0, -1] / 1, dim=0)
-            topk_probs, topk_indices = torch.topk(probs, 40)
-            next_token = topk_indices[torch.multinomial(topk_probs, 1)].item()
+            baseline = True
+            if not baseline:
+                logits, _ = model.recursive_forward(input_seq, tol=recursive_convergence_tolerance)
+            else:
+                logits, _, _, _ = model.forward(input_seq)
+            # 1) temperature
+            temperature = 0.8
+            probs = torch.softmax(logits[0, -1] / temperature, dim=0)
+            # 1) sort by descending probability
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            # 2) compute cumulative sum to do top‑p
+            cum_probs = torch.cumsum(sorted_probs, dim=0)
+            p = 0.9
+            mask = cum_probs <= p
+            # ensure at least the highest‑prob token remains
+            mask[0] = True
+            filtered = sorted_probs * mask
+            filtered_sum = filtered.sum()
+            # fallback if something went wrong (zero sum)
+            if filtered_sum <= 0 or torch.isnan(filtered_sum):
+                filtered = sorted_probs[:1]
+                sorted_indices = sorted_indices[:1]
+                filtered_sum = filtered.sum()
+            # normalize to get a valid distribution
+            filtered = filtered / filtered_sum
+            next_token = sorted_indices[torch.multinomial(filtered, 1)].item()
             generated.append(next_token)
 
 
@@ -88,12 +112,17 @@ while True:
     print("\nGenerated continuation:\n", output_text.strip())
 
     # --- Diagnostics ---
-    if hasattr(model, 'resolution_score'):
-        print(f"[resolution score]: {model.resolution_score:.4f}")
-    if hasattr(model, 'attention_trajectory') and model.attention_trajectory:
-        last_attn = model.attention_trajectory[-1]
-        if last_attn.dim() == 4:
-            self_attn_mean = last_attn[:, :, 0, 0].mean().item()
-            print(f"[self-attn mean]: {self_attn_mean:.4f}")
-    if hasattr(model, 'surprisal_trajectory'):
-        print(f"[steps to converge]: {len(model.surprisal_trajectory)}")
+    if not baseline:
+        if hasattr(model, 'resolution_score'):
+            print(f"[resolution score]: {model.resolution_score:.4f}")
+        if hasattr(model, 'attention_trajectory') and model.attention_trajectory:
+            last_attn = model.attention_trajectory[-1]
+            if isinstance(last_attn, torch.Tensor) and last_attn.dim() == 4:
+                self_attn_mean = last_attn[:, :, 0, 0].mean().item()
+                print(f"[self-attn mean]: {self_attn_mean:.4f}")
+            else:
+                # (fall‑through or alternative for non‑tensor last_attn)
+                # last_attn is just a scalar mean‐attention; handle or skip accordingly
+                self_attn_mean = float(last_attn)
+        if hasattr(model, 'surprisal_trajectory'):
+            print(f"[steps to converge]: {len(model.surprisal_trajectory)}")

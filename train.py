@@ -14,18 +14,21 @@ from sklearn.decomposition import PCA
 from collections import deque
 import pandas as pd
 import plotly.express as px
+import time
 
 # === Hyperparameters & Config ===
 from config import (
     baseline,
     d_model, num_heads, num_layers,
     resonant_token_count, dynamic_resonant_token_count,
+    token_learning_amplifier,
     sequence_length, max_tokens, learning_rate,
     batch_size, num_epochs, warmup_epochs,
     lambda_ri, lambda_rs, lambda_div,
     lambda_sur, lambda_attn, lambda_res,
     multihead_resonance,
-    max_recursive_steps
+    max_recursive_steps,
+    recursive_convergence_tolerance
 )
 
 if baseline:
@@ -42,7 +45,7 @@ millions = int(max_tokens / 1_000_000)
 run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
 
 # Initialize wandb
-wandb.init(project="resonant-transformer-recursive", name=run_name, config={
+wandb.init(project="resonant-transformer-RoPE2", name=run_name, config={
     **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
         'd_model','num_heads','num_layers','resonant_token_count',
         'dynamic_resonant_token_count','learning_rate','batch_size',
@@ -73,14 +76,26 @@ tokenizer.add_special_tokens(["<pad>", "<unk>"])
 pad_id = tokenizer.token_to_id("<pad>")
 tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 
-# Encode corpus
+# Encode corpus with stride-based chunking for more coverage
 tokens = []
 with open(corpus_path, "r", encoding="utf-8") as f:
     for line in f:
-        tokens.extend(tokenizer.encode(line.strip()).ids)
+        line = line.strip()
+        if line:
+            tokens.extend(tokenizer.encode(line).ids)
         if len(tokens) >= max_tokens:
             break
-sequences = torch.tensor([tokens[i:i+sequence_length] for i in range(0, len(tokens)-sequence_length, sequence_length)], dtype=torch.long).to(DEVICE)
+
+# Allow overlapping chunks to multiply training data diversity
+stride = sequence_length // 2  # 50% overlap
+seqs = []
+for i in range(0, len(tokens) - sequence_length, stride):
+    chunk = tokens[i:i+sequence_length]
+    if len(chunk) == sequence_length:
+        seqs.append(chunk)
+
+sequences = torch.tensor(seqs, dtype=torch.long).to(DEVICE)
+
 loader = DataLoader(sequences, batch_size=batch_size, shuffle=True, drop_last=True)
 
 # Model & Hooks
@@ -96,36 +111,47 @@ model = EnhancedResonantTransformer(
 ).to(DEVICE)
 model.train()
 
+torch.autograd.set_detect_anomaly(True)
+
+# — Prepare a precise set of only the resonant‑token params for inner updates —
+inner_res_params = set()
+if resonant_token_count > 0:
+    inner_res_params.add(model.resonant_tokens)
+if dynamic_resonant_token_count > 0:
+    inner_res_params.update(model.controller.parameters())
+if multihead_resonance:
+    inner_res_params.update(model.resonator.parameters())
+
 # Attention hook setup: register on custom encoder_layers
 attn_records = []
 def attn_hook(module, inp, output):
     # output is (attn_output, attn_weights)
     if isinstance(output, tuple) and output[1] is not None:
         attn_records.append(output[1].detach())
-for layer in model.encoder_layers:
-    layer.self_attn.register_forward_hook(attn_hook)
+if not baseline and lambda_attn != 0:
+    for layer in model.encoder_layers:
+        layer.register_forward_hook(attn_hook)
 avg_attn = None
 attn_momentum = 0.99
 
 # Optimizer & Criterion
 # opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
 # in train.py, when you build the optimizer:
-token_learning_amplifier = 320
-opt = torch.optim.Adam([
-    # everything else
-    {'params': [p for n,p in model.named_parameters() if 'resonant_tokens' not in n
-                and 'controller' not in n and 'resonator' not in n],
-     'lr': learning_rate},
-    # static tokens
-    {'params': [model.resonant_tokens], 
-     'lr': learning_rate * token_learning_amplifier},
-    # dynamic tokens
-    {'params': model.controller.parameters(), 
-     'lr': learning_rate * token_learning_amplifier},
-    # if using multihead:
-    {'params': model.resonator.parameters(), 
-     'lr': learning_rate * token_learning_amplifier},
-])
+if not baseline:
+    # During warmup, exclude resonant token params
+    opt = torch.optim.Adam([
+        {'params': [p for n, p in model.named_parameters()
+                    if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+         'lr': learning_rate}
+    ])
+else:
+    opt = torch.optim.Adam([
+        # everything else
+        {'params': [p for n,p in model.named_parameters() if 'resonant_tokens' not in n
+                    and 'controller' not in n and 'resonator' not in n],
+        'lr': learning_rate}
+    ])
+    
 
 crit = nn.CrossEntropyLoss(ignore_index=pad_id)
 last_res=None
@@ -133,13 +159,52 @@ last_res=None
 sur_baseline = None
 res_baseline = None
 
+last_run_time = time.time()
+
+
 # Training
 for epoch in range(num_epochs):
+
+    # Disable updates to resonant token parameters during warmup
+    if epoch < warmup_epochs:
+        for p in inner_res_params:
+            p.requires_grad = False
+    else:
+        for p in inner_res_params:
+            p.requires_grad = True
+
+    # === Rebuild optimizer at end of warmup to include resonant params ===
+    if epoch == warmup_epochs:
+        print(f"Rebuilding optimizer at epoch {epoch}")
+        opt = torch.optim.Adam([
+            {'params': [p for n, p in model.named_parameters()
+                        if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+             'lr': learning_rate},
+            {'params': [model.resonant_tokens],
+             'lr': learning_rate * token_learning_amplifier},
+            {'params': model.controller.parameters(),
+             'lr': learning_rate * token_learning_amplifier},
+            {'params': model.resonator.parameters(),
+             'lr': learning_rate * token_learning_amplifier}
+        ])
+
+    # Rebuild fresh references to resonant-token parameters
+    inner_res_params = set()
+    if resonant_token_count > 0:
+        inner_res_params.add(model.resonant_tokens)
+    if dynamic_resonant_token_count > 0:
+        inner_res_params.update(model.controller.parameters())
+    if multihead_resonance:
+        inner_res_params.update(model.resonator.parameters())
+
     model.alpha = cosine_rampup(epoch, warmup_epochs)
     for bidx,batch in enumerate(loader):
         inp = batch[:,:-1]; tgt = batch[:,1:]
         ctx = last_res if last_res is not None else inp
-        logits, res = model.recursive_forward(inp, ctx)
+        if not baseline:
+            logits, res = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance)
+        else:
+            logits, res, _, _ = model.forward(inp, ctx)
         steps = getattr(model, "last_recursive_steps", 0)
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)
@@ -200,11 +265,22 @@ for epoch in range(num_epochs):
         if not baseline:
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
-            coh, res, _, _ = model(ci, ci)
-            con = contrastive_loss(logits, coh)
+            # compute contrastive logits via recursive inference
+            contrast_logits, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
+            con = contrastive_loss(logits, contrast_logits)
             primary = primary + con
         else:
             con = torch.tensor(0.0, device=DEVICE)
+
+        # — Entropy bonus (discourage low‑entropy repetition) —
+        if not baseline:
+            # log‑probabilities over the full vocab
+            lp_ent = F.log_softmax(logits, dim=-1)      # shape [B, L, V]
+            pr_ent = lp_ent.exp()                       # shape [B, L, V]
+            # entropy per token = −∑ p log p; then mean over batch & sequence
+            ent_loss = -(pr_ent * lp_ent).sum(-1).mean()  
+            # small weight to reward higher entropy
+            primary = primary - 1e-4 * ent_loss
 
         # first build the final loss including these terms
         term1 = term2 = 0.0
@@ -233,18 +309,19 @@ for epoch in range(num_epochs):
         opt.zero_grad()
         final.backward()
 
-        # NOW extract the _actual_ gradients on the resonant tokens
-        # — raw‐dot RI & standard RS (no grad‑norm division) —
-        gr = model._res_tokens_for_ri.grad       # (B, T, D)
-        # raw absolute dot ⇝ “influence” magnitude
-        ri_v     = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()   # (B, T)
-        # cosine penalty unchanged
-        rs_v     = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-        val_ri   = ri_v.mean().item()
-        val_rs   = rs_v.mean().item()
-        
-        cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-        val_cos_sim = cos_sim_v.mean().item()
+        if not baseline:
+            # NOW extract the _actual_ gradients on the resonant tokens
+            # — raw‐dot RI & standard RS (no grad‑norm division) —
+            gr = model._res_tokens_for_ri.grad       # (B, T, D)
+            # raw absolute dot ⇝ “influence” magnitude
+            ri_v     = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()   # (B, T)
+            # cosine penalty unchanged
+            rs_v     = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+            val_ri   = ri_v.mean().item()
+            val_rs   = rs_v.mean().item()
+            
+            cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+            val_cos_sim = cos_sim_v.mean().item()
 
         
         other_params = [p for n,p in model.named_parameters()
@@ -252,19 +329,28 @@ for epoch in range(num_epochs):
                         and 'controller' not in n
                         and 'resonator' not in n]
         torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
+
         opt.step()
+
+        # Clamp resonant token norms post-update to prevent explosion
+        with torch.no_grad():
+            if hasattr(model, 'resonant_tokens'):
+                norm = model.resonant_tokens.norm(dim=-1, keepdim=True).clamp(min=1.0, max=10.0)
+                model.resonant_tokens.copy_(model.resonant_tokens / norm)
+
         # every 100 batches, give tokens 5 exclusive mini‑steps:
-        if bidx % 100 == 0 and (resonant_token_count + dynamic_resonant_token_count) > 0:
-            # 1) freeze all but token/controller/resonator params
-            for n, p in model.named_parameters():
-                p.requires_grad = any(k in n for k in
-                    ['resonant_tokens','controller','resonator'])
+        if epoch >= warmup_epochs and bidx % 100 == 0 and (resonant_token_count + dynamic_resonant_token_count) > 0:
+            # 1) freeze all except the exact inner_res_params
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in inner_res_params:
+                p.requires_grad = True
 
             # 2) inner token‑only loop
             for _ in range(5):
 
                 # recompute primary to get a fresh autograd graph
-                logits, res = model.recursive_forward(inp)
+                logits, res = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
                 logits = logits[:, :inp.size(1), :]
                 primary_inner = crit(
                     logits.reshape(-1, logits.size(-1)),
@@ -314,28 +400,48 @@ for epoch in range(num_epochs):
                 resolution_score = model.resolution_score
 
             if hasattr(model, 'attention_trajectory') and model.attention_trajectory:
-                # For now, track only the final step's mean attention to [SELF] token
-                last_attn = model.attention_trajectory[-1]  # (B, T, T)
-                # take the [SELF] token at position 0 → query idx 0, key idx 0
-                self_attn_mean = last_attn[:, 0, 0].mean().item()
+                # attention_trajectory now holds scalar mean-attention values
+                self_attn_mean = model.attention_trajectory[-1]
 
+
+            if not baseline:
+                if last_res is not None:
+                    ctx_emb = model.embedding(last_res) if last_res.dtype in (torch.int64, torch.int32) else last_res
+                    context_vec = ctx_emb.mean(dim=1)
+                elif model.global_res is not None:
+                    context_vec = model.global_res.mean(dim=1).expand(batch_size, -1).contiguous()
+                else:
+                    context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
 
 
             if (resonant_token_count + dynamic_resonant_token_count) == 0:
                 val_ri = 0.0
                 val_rs = 0.0
+                res_token_norm = 0.0
+                stat_norm = 0.0
+                dyn_norm = 0.0
+                mh_norm = 0.0
             else:
                 val_ri = ri_v.mean().item()
                 val_rs = rs_v.mean().item()
+                res_token_norm = model._res_tokens_for_ri.norm().item()
+                stat_norm = model.resonant_tokens.norm().item()
+                dyn_norm = model.controller(context_vec).norm().item() if hasattr(model, 'controller') else 0
+                mh_norm = model.resonator(context_vec).norm().item() if hasattr(model, 'resonator') else 0
 
             if baseline:
                 val_sr = 0.0
                 val_akl = 0.0
                 val_rr = 0.0
+                val_cos_sim = 0
             else:
                 val_sr = sur_reward.item()
                 val_akl = akl.item()
                 val_rr = res_reward.item()
+            
+            now = time.time()
+            delta_s = now - last_run_time
+            last_run_time = now
 
             wandb.log({
                 'loss':final.item(),
@@ -346,15 +452,47 @@ for epoch in range(num_epochs):
                 'surprisal_reward':val_sr,
                 'attention_kl':val_akl,
                 'resolution_score':resolution_score,
+                'res_token_norm': res_token_norm,
+                'static_res_norm': stat_norm,
+                'dynamic_res_norm': dyn_norm,
+                'multihead_res_norm': mh_norm,
                 'self_attn_mean':self_attn_mean,
                 'recursive_steps':steps
             }, step=global_step)
-            print(f"{global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | L: {final.item():.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.6f} | RSC: {val_cos_sim:.6f} | STEPS: {steps}")
+            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.6f} | RSC: {val_cos_sim:.6f} | STEPS: {steps}")
+
+    # === Save checkpoint at end of this epoch ===
+    if (epoch + 1) % 10 == 0:
+        state = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'epoch': epoch + 1,
+            'config': {
+                'vocab_size': tokenizer.get_vocab_size(),
+                'sequence_length': sequence_length,
+                'd_model': d_model,
+                'num_heads': num_heads,
+                'num_layers': num_layers,
+                'max_tokens': max_tokens,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'num_epochs': num_epochs,
+                'warmup_epochs': warmup_epochs,
+                'resonant_token_count': resonant_token_count,
+                'dynamic_resonant_token_count': dynamic_resonant_token_count,
+                'multihead': multihead_resonance
+            },
+            'final_resonant_state': getattr(model, '_res_tokens_for_ri', None)
+        }
+        epoch_filename = f"training-checkpoint-epoch{epoch+1}.pt"
+        torch.save(state, epoch_filename)
+        print(f"Checkpoint saved to {epoch_filename} at end of epoch {epoch+1}")
 
 # Save final state
 state = {
     'model_state_dict': model.state_dict(),
     'config': {
+        'baseline': baseline,
         'vocab_size': tokenizer.get_vocab_size(),
         'sequence_length': sequence_length,
         'd_model': d_model,
