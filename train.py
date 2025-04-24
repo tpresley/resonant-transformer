@@ -283,7 +283,7 @@ for epoch in range(num_epochs):
             primary = primary - 1e-4 * ent_loss
 
         # first build the final loss including these terms
-        term1 = term2 = 0.0
+        term1 = term2 = term3 = 0.0
         dvt   = torch.tensor(0.0, device=DEVICE)
         if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
             # compute gradient w.r.t. the resonant tokens (may be None if unused)
@@ -303,7 +303,13 @@ for epoch in range(num_epochs):
             rs_v  = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
             term2 = lambda_rs * rs_v.mean()
             dvt   = lambda_div * diversity_penalty(model._res_tokens_for_ri)
-        final = primary - term1 - term2 + dvt
+        
+        self_model_loss_weight = 0.1
+        if hasattr(model, 'last_self_model_loss'):
+            term3 = model.last_self_model_loss * self_model_loss_weight
+        
+        
+        final = primary - term1 - term2 + term3 + dvt
 
         # Backprop the full loss
         opt.zero_grad()

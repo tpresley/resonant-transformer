@@ -139,6 +139,10 @@ class EnhancedResonantTransformer(nn.Module):
         self.alpha = 0.0
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.token_scale = nn.Parameter(torch.tensor(1.0))
+        # Self-model for recursive state prediction
+        self.self_model = SelfModel(hidden_size=self.hidden_size, depth=3)
+        self.self_model_loss_fn = nn.MSELoss()
+
 
         if self.dynamic_resonant_token_count > 0:
             self.controller = ResonantController(d_model, self.dynamic_resonant_token_count)
@@ -245,10 +249,11 @@ class EnhancedResonantTransformer(nn.Module):
             max_steps = self.max_recursive_steps
 
         current_context = context
+        past_internal_states = []
         for step in range(max_steps):
             # run forward but don’t update global_res; feed in current_context
             logits, res, attn_maps, hidden = self.forward(x, current_context, update_global=False)
-            
+
             # record scalar summaries instead of full tensors
             self.surprisal_trajectory.append(logits.detach().norm().item())
             if attn_maps:
@@ -274,7 +279,25 @@ class EnhancedResonantTransformer(nn.Module):
             # update context for next iteration
             current_context = hidden.detach()
 
-        self.last_recursive_steps = step + 1
+            hidden_state_t = hidden[:, 0, :]  # track first token (position 0) as representative
+            past_internal_states.append(hidden_state_t.detach())
+            if len(past_internal_states) > self.self_model.depth:
+                past_internal_states.pop(0)
+
+
+        if len(past_internal_states) == self.self_model.depth:
+            past_tensor = torch.stack(past_internal_states, dim=1)  # shape: (batch, depth, hidden)
+            predicted_next = self.self_model(past_tensor)
+            target_next = hidden[:, 0, :].detach()  # final real internal state
+            self_model_loss = self.self_model_loss_fn(predicted_next, target_next)
+        else:
+            self_model_loss = torch.tensor(0.0, device=hidden.device)
+
+        self.last_self_model_loss = self_model_loss
+
+
+        # Store it on self for training access
+        self.last_self_model_loss = self_model_loss
 
         # Single EMA update after recursion
         momentum = 0.9
@@ -291,7 +314,23 @@ class EnhancedResonantTransformer(nn.Module):
                 self.global_res = batch_mean_res.detach()
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
+
         return logits, res
+
+class SelfModel(nn.Module):
+    def __init__(self, hidden_size, depth=3):
+        super().__init__()
+        self.depth = depth
+        self.linear = nn.Sequential(
+            nn.Linear(hidden_size * depth, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+
+    def forward(self, past_states):  # shape: (batch, depth, hidden)
+        x = past_states.reshape(past_states.size(0), -1)
+        return self.linear(x)
+
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):
     orig_repr = original_logits.mean(dim=1)
