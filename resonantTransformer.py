@@ -187,6 +187,13 @@ class EnhancedResonantTransformer(nn.Module):
         self_tok = self.self_token.expand(B, -1, -1)
         emb = torch.cat([self_tok, emb], dim=1)
 
+        if padding_mask is not None:
+            B, L = padding_mask.shape
+            padding_mask = torch.cat([
+                torch.zeros(B, 1, dtype=padding_mask.dtype, device=padding_mask.device),
+                padding_mask
+            ], dim=1)
+
         if segment_ids is not None:
             seg_emb = self.segment_embedding(segment_ids)
             emb = emb + seg_emb
@@ -237,6 +244,13 @@ class EnhancedResonantTransformer(nn.Module):
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
 
+        if padding_mask is not None:
+            num_res_tokens = tokens.size(1)
+            padding_mask = torch.cat([
+                torch.zeros(B, num_res_tokens, dtype=padding_mask.dtype, device=padding_mask.device),
+                padding_mask
+            ], dim=1)
+
         if tokens.numel() > 0:
             self._res_tokens_for_ri = tokens
             if tokens.requires_grad:
@@ -271,7 +285,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
-    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5):
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None):
         """
         Full recursive inference with:
         - entropy / resolution / attention tracking
@@ -307,7 +321,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.last_recursive_steps = 1
 
         for step in range(num_steps):
-            logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False)
+            logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
 
             # === Entropy / surprisal tracking ===

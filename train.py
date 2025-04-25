@@ -16,6 +16,13 @@ import pandas as pd
 import plotly.express as px
 import time
 
+def collate_dynamic(batch):
+    lengths = [len(x) for x in batch]
+    max_len = max(lengths)
+    pad_id = tokenizer.token_to_id("<pad>")
+    padded = [x + [pad_id] * (max_len - len(x)) for x in batch]
+    return torch.tensor(padded, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
+
 # === Hyperparameters & Config ===
 from config import (
     baseline,
@@ -54,6 +61,8 @@ wandb.init(project="resonant-transformer-RoPE2", name=run_name, config={
     ]}
 })
 
+print("Prep Data")
+
 # Data preparation (unchanged)
 dataset = load_dataset("roneneldan/TinyStories", split="train")
 corpus_path = "tinystories_cached.txt"
@@ -63,6 +72,8 @@ if not os.path.exists(corpus_path):
             line = entry['text'].strip()
             if line:
                 f.write(line + "\n")
+
+print("Tokenizer Setup")
 
 # Tokenizer setup
 tokenizer_dir = "tokenizer-tinystories"
@@ -79,34 +90,52 @@ tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
 pad_id = tokenizer.token_to_id("<pad>")
 tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 
-# Encode corpus with stride-based chunking for more coverage
+print("Encode Corpus")
+
 tokens = []
+max_stories = 500_000
+story_count = 0
+buffer = []
+stride = sequence_length // 3
+bos_id = tokenizer.token_to_id("<bos>")
+eos_id = tokenizer.token_to_id("<eos>")
+
 with open(corpus_path, "r", encoding="utf-8") as f:
     for line in f:
+        story_count += 1
+        if story_count >= max_stories:
+            break
         line = line.strip()
         if line:
-            # === Process one story at a time ===
-            encoded = tokenizer.encode(line)
-            bos_id = tokenizer.token_to_id("<bos>")
-            eos_id = tokenizer.token_to_id("<eos>")
-            full_story = [bos_id] + encoded.ids + [eos_id]
+            try:
+                encoded = tokenizer.encode(line)
+            except Exception as e:
+                print("Tokenizer error on line:", repr(line))
+                raise
+            story_tokens = [bos_id] + encoded.ids + [eos_id]
+            buffer.extend(story_tokens)
 
-            # Break the story into overlapping sequences
-            stride = sequence_length // 2
-            for i in range(0, len(full_story) - sequence_length + 1, stride):
-                chunk = full_story[i:i+sequence_length]
-                if len(chunk) == sequence_length:
-                    tokens.append(chunk)
+            # Create chunks from the buffer
+            while len(buffer) >= sequence_length:
+                chunk = buffer[:sequence_length]
+                tokens.append(chunk)
+                buffer = buffer[stride:]
 
             if len(tokens) * sequence_length >= max_tokens:
                 break
 
-# Remove this entire chunker later:
+    # Handle leftover tokens (optional)
+    if len(buffer) >= sequence_length // 2:
+        pad_id = tokenizer.token_to_id("<pad>")
+        padded = buffer + [pad_id] * (sequence_length - len(buffer))
+        tokens.append(padded[:sequence_length])
+
+print("Build Tensor From Chunks")
 
 # Build tensor from pre-chunked list
-sequences = torch.tensor(tokens, dtype=torch.long).to(DEVICE)
+all_sequences = tokens  # list of variable-length sequences
 
-loader = DataLoader(sequences, batch_size=batch_size, shuffle=True, drop_last=True)
+loader = DataLoader(all_sequences, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_dynamic)
 
 # Model & Hooks
 model = EnhancedResonantTransformer(
@@ -123,6 +152,8 @@ model.train()
 
 torch.autograd.set_detect_anomaly(True)
 
+print("Add Resonant Token Parameters")
+
 # — Prepare a precise set of only the resonant‑token params for inner updates —
 inner_res_params = set()
 if resonant_token_count > 0:
@@ -131,6 +162,8 @@ if dynamic_resonant_token_count > 0:
     inner_res_params.update(model.controller.parameters())
 if multihead_resonance:
     inner_res_params.update(model.resonator.parameters())
+
+print("Add Attention Hooks")
 
 # Attention hook setup: register on custom encoder_layers
 attn_records = []
@@ -208,12 +241,18 @@ for epoch in range(num_epochs):
         inner_res_params.update(model.resonator.parameters())
 
     model.alpha = cosine_rampup(epoch, warmup_epochs)
-    for bidx,batch in enumerate(loader):
-        inp = batch[:,:-1]; tgt = batch[:,1:]
+    for bidx, (batch, lengths) in enumerate(loader):
+        inp = batch[:, :-1]
+        inp = inp.to(DEVICE)
+        tgt = batch[:, 1:]
+        tgt = tgt.to(DEVICE)
         ctx = last_res if last_res is not None else inp
 
         pad_id = tokenizer.token_to_id("<pad>")
         padding_mask = (inp == pad_id)
+
+        ctx = ctx.to(DEVICE)
+        padding_mask = padding_mask.to(DEVICE)
 
         if not baseline:
             logits, res = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)

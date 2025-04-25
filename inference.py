@@ -3,7 +3,6 @@ import torch
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from resonantTransformer import EnhancedResonantTransformer
-
 from config import recursive_convergence_tolerance, baseline
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,8 +30,10 @@ tokenizer = ByteLevelBPETokenizer(
     f"{tokenizer_dir}/vocab.json",
     f"{tokenizer_dir}/merges.txt"
 )
-tokenizer.add_special_tokens(["<pad>", "<unk>"])
+tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
 pad_id = tokenizer.token_to_id("<pad>")
+bos_id = tokenizer.token_to_id("<bos>")
+eos_id = tokenizer.token_to_id("<eos>")
 tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 
 vocab_size = tokenizer.get_vocab_size()
@@ -69,20 +70,35 @@ while True:
     if not user_input:
         break
 
+    # === Encode with <bos> and <eos> ===
     encoded = tokenizer.encode(user_input)
-    tokens = encoded.ids[:sequence_length]
-    if len(tokens) < sequence_length:
+    tokens = [bos_id] + encoded.ids
+    tokens = tokens[:sequence_length]
+    input_length = len(tokens)
+    if input_length < sequence_length:
         tokens += [pad_id] * (sequence_length - len(tokens))
 
-    generated = tokens[:sequence_length]
+    generated = tokens[:]
     with torch.no_grad():
-        for _ in range(100):
-            input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long) \
-                                .unsqueeze(0).to(DEVICE)
-            if not baseline:
-                logits, _ = model.recursive_forward(input_seq, context=input_seq, tol=recursive_convergence_tolerance)
+        for current in range(100):
+            input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long).unsqueeze(0).to(DEVICE)
+            padding_mask = (input_seq == pad_id)
+
+            # === Match training context derivation ===
+            if model.global_res is not None:
+                context = model.global_res.mean(dim=1).expand(input_seq.size(0), -1).contiguous()
             else:
-                logits, _, _, _ = model.forward(input_seq)
+                context = model.self_token.expand(input_seq.size(0), -1, -1).mean(dim=1)
+
+            if not baseline:
+                logits, _ = model.recursive_forward(
+                    input_seq,
+                    context=context,
+                    tol=recursive_convergence_tolerance,
+                    padding_mask=padding_mask
+                )
+            else:
+                logits, _, _, _ = model.forward(input_seq, context=context, padding_mask=padding_mask)
             # 1) temperature
             temperature = 0.8
             probs = torch.softmax(logits[0, -1] / temperature, dim=0)
@@ -105,10 +121,17 @@ while True:
             filtered = filtered / filtered_sum
             next_token = sorted_indices[torch.multinomial(filtered, 1)].item()
             generated.append(next_token)
+            if next_token == eos_id:
+                print(f"Found EOS at token {current}")
+                break
 
 
-    output_text = tokenizer.decode(generated[len(tokens):], skip_special_tokens=True)
-    output_text = output_text.replace("Ġ", " ").replace("@@", "").replace("â", "'").strip()
+    if eos_id in generated:
+        eos_index = generated.index(eos_id)
+        print(f"Found EOS in generated string at {eos_id}")
+        generated = generated[:eos_index + 1]
+
+    output_text = tokenizer.decode(generated[input_length:], skip_special_tokens=True)
     print("\nGenerated continuation:\n", output_text.strip())
 
     # --- Diagnostics ---
