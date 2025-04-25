@@ -68,12 +68,14 @@ if not os.path.exists(corpus_path):
 tokenizer_dir = "tokenizer-tinystories"
 if not os.path.exists(tokenizer_dir):
     tokenizer = ByteLevelBPETokenizer()
-    tokenizer.train(files=[corpus_path], vocab_size=16000, min_frequency=2, special_tokens=["<pad>", "<unk>"])
+    tokenizer.train(
+        files=[corpus_path],
+        vocab_size=16000, min_frequency=2, special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"])
     tokenizer.save_model(tokenizer_dir)
 else:
     tokenizer = ByteLevelBPETokenizer(f"{tokenizer_dir}/vocab.json", f"{tokenizer_dir}/merges.txt")
 
-tokenizer.add_special_tokens(["<pad>", "<unk>"])
+tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
 pad_id = tokenizer.token_to_id("<pad>")
 tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 
@@ -83,19 +85,26 @@ with open(corpus_path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if line:
-            tokens.extend(tokenizer.encode(line).ids)
-        if len(tokens) >= max_tokens:
-            break
+            # === Process one story at a time ===
+            encoded = tokenizer.encode(line)
+            bos_id = tokenizer.token_to_id("<bos>")
+            eos_id = tokenizer.token_to_id("<eos>")
+            full_story = [bos_id] + encoded.ids + [eos_id]
 
-# Allow overlapping chunks to multiply training data diversity
-stride = sequence_length // 2  # 50% overlap
-seqs = []
-for i in range(0, len(tokens) - sequence_length, stride):
-    chunk = tokens[i:i+sequence_length]
-    if len(chunk) == sequence_length:
-        seqs.append(chunk)
+            # Break the story into overlapping sequences
+            stride = sequence_length // 2
+            for i in range(0, len(full_story) - sequence_length + 1, stride):
+                chunk = full_story[i:i+sequence_length]
+                if len(chunk) == sequence_length:
+                    tokens.append(chunk)
 
-sequences = torch.tensor(seqs, dtype=torch.long).to(DEVICE)
+            if len(tokens) * sequence_length >= max_tokens:
+                break
+
+# Remove this entire chunker later:
+
+# Build tensor from pre-chunked list
+sequences = torch.tensor(tokens, dtype=torch.long).to(DEVICE)
 
 loader = DataLoader(sequences, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -202,10 +211,14 @@ for epoch in range(num_epochs):
     for bidx,batch in enumerate(loader):
         inp = batch[:,:-1]; tgt = batch[:,1:]
         ctx = last_res if last_res is not None else inp
+
+        pad_id = tokenizer.token_to_id("<pad>")
+        padding_mask = (inp == pad_id)
+
         if not baseline:
-            logits, res = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance)
+            logits, res = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
         else:
-            logits, res, _, _ = model.forward(inp, ctx)
+            logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
         steps = getattr(model, "last_recursive_steps", 0)
         logits = logits[:,:inp.size(1)]
         # Primary loss (CE)

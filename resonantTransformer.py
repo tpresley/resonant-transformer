@@ -143,6 +143,9 @@ class EnhancedResonantTransformer(nn.Module):
         self.alpha = 0.0
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.token_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Optional segment embedding (2 segments: A and B)
+        self.segment_embedding = nn.Embedding(2, d_model)
         # Self-model for recursive state prediction
         self.self_model = SelfModel(hidden_size=self.d_model, depth=3)
         self.self_model_loss_fn = nn.MSELoss()
@@ -178,11 +181,15 @@ class EnhancedResonantTransformer(nn.Module):
         self.encoder_layers = nn.ModuleList(layers)
         self.output = LawfulLinear(d_model, vocab_size)
 
-    def forward(self, x, context=None, update_global=True):
+    def forward(self, x, context=None, update_global=True, padding_mask=None, segment_ids=None):
         emb = self.embedding(x)
         B = emb.size(0)
         self_tok = self.self_token.expand(B, -1, -1)
         emb = torch.cat([self_tok, emb], dim=1)
+
+        if segment_ids is not None:
+            seg_emb = self.segment_embedding(segment_ids)
+            emb = emb + seg_emb
 
         # === Derive context vector ===
         if context is not None:
@@ -244,7 +251,7 @@ class EnhancedResonantTransformer(nn.Module):
         attn_maps = []
         out = inp
         for layer in self.encoder_layers:
-            out, weights = layer(out)
+            out, weights = layer(out, src_key_padding_mask=padding_mask)
             attn_maps.append(weights)
 
         # Extract sequence hidden states (excluding resonant tokens)
