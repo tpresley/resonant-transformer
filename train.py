@@ -360,14 +360,6 @@ for epoch in range(num_epochs):
         dvt   = torch.tensor(0.0, device=DEVICE)
         if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
             # compute gradient w.r.t. the resonant tokens (may be None if unused)
-            
-            print("=== Debugging autograd.grad call ===")
-            print(f"primary requires_grad: {primary.requires_grad}")
-            print(f"_res_tokens_for_ri requires_grad: {model._res_tokens_for_ri.requires_grad}")
-            print(f"_res_tokens_for_ri is leaf: {model._res_tokens_for_ri.is_leaf}")
-            print(f"_res_tokens_for_ri dtype: {model._res_tokens_for_ri.dtype}")
-
-
             grad_tuple = torch.autograd.grad(
                 primary, model._res_tokens_for_ri,
                 retain_graph=True,
