@@ -23,7 +23,7 @@ model_path = pt_files[selected_idx]
 # Load state from file
 state = torch.load(model_path, map_location=DEVICE)
 model_config = state["config"]
-resonant_context = state.get("final_dynamic_resonant_state", None)
+resonant_context = state.get("final_resonant_state", None)
 
 # Load tokenizer
 tokenizer_dir = "tokenizer-tinystories"
@@ -47,7 +47,8 @@ model = EnhancedResonantTransformer(
     num_layers=model_config["num_layers"],
     resonant_token_count=model_config["resonant_token_count"],
     dynamic_resonant_token_count=model_config["dynamic_resonant_token_count"],
-    multihead=model_config.get("multihead", False)
+    multihead=model_config.get("multihead", False),
+    max_recursive_steps=model_config["max_recursive_steps"] if hasattr(model_config, "max_recursive_steps") else 5
 )
 # Resize saved context to match inference-time batch size
 if resonant_context is not None:
@@ -79,8 +80,7 @@ while True:
             input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long) \
                                 .unsqueeze(0).to(DEVICE)
             if not baseline:
-                model.reset_flux_budget()
-                logits, _ = model.recursive_forward(input_seq, tol=recursive_convergence_tolerance)
+                logits, _ = model.recursive_forward(input_seq, context=input_seq, tol=recursive_convergence_tolerance)
             else:
                 logits, _, _, _ = model.forward(input_seq)
             # 1) temperature

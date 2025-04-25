@@ -148,9 +148,10 @@ class EnhancedResonantTransformer(nn.Module):
         self.self_model_loss_fn = nn.MSELoss()
         self._res_tokens_for_ri = None
 
-        self.max_flux_budget = 1.0
-        self.flux_budget = self.max_flux_budget
-        self.regen_rate_scale = 0.1  # α in the formula
+        self.flux_budget = None         # No initial limit
+        self.budget_ema = None          # Moving baseline
+        self.budget_alpha = 2.5         # Multiplier over recent average cost
+        self.budget_beta = 0.05         # EMA smoothing factor
 
         self.entropy_ema = torch.tensor(1.0)
         self.attn_kl_ema = torch.tensor(1.0)
@@ -296,6 +297,8 @@ class EnhancedResonantTransformer(nn.Module):
         res = None
         attn_maps = None
 
+        self.last_recursive_steps = 1
+
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False)
 
@@ -323,18 +326,17 @@ class EnhancedResonantTransformer(nn.Module):
                 previous_attention = attn_maps[-1]
                 self.attention_trajectory.append(previous_attention.mean().item())
 
+            # === Resolution score via recursive delta ===
             if step == 0:
-                previous_resolution = res.detach()
+                previous_res = res.detach()
                 resolution_score = torch.tensor(0.0, device=res.device)
             else:
-                resolution_score = torch.norm(res - previous_resolution, dim=-1).mean()
-                previous_resolution = res.detach()
-
+                resolution_score = torch.norm(res - previous_res, dim=-1).mean()
                 delta = resolution_score.item()
                 if delta < tol:
                     print(f"Converged early at step {step}: Δres={delta:.2e} < tol={tol}")
                     break
-
+                previous_res = res.detach()
             resolution_scores.append(resolution_score)
             self.resolution_score = resolution_score
 
@@ -358,12 +360,21 @@ class EnhancedResonantTransformer(nn.Module):
             flux_cost = norm_entropy + norm_attn + norm_res
             flux_cost = flux_cost.mean()
 
-            self.flux_budget -= flux_cost.item()
+            # Clamp cost and enforce non-negative budget
+            capped_cost = min(flux_cost.item(), 2.0)  # Cap optional
+            # === Self-calibrate dynamic flux budget ===
+            if self.budget_ema is None:
+                self.budget_ema = flux_cost.item()
+                self.flux_budget = self.budget_alpha * self.budget_ema
+            else:
+                self.budget_ema = (1 - self.budget_beta) * self.budget_ema + self.budget_beta * flux_cost.item()
+                self.flux_budget = self.budget_alpha * self.budget_ema
+
             self.last_flux_cost = flux_cost.item()
 
-            print(f" - RES: {resolution_score:.2e} | FCOST {flux_cost:.2e} | FBUDG: {self.flux_budget:.2e}")
-
-            if self.flux_budget <= 0:
+            # === Fatigue check based on adaptive budget ===
+            if flux_cost.item() > self.flux_budget:
+                print(f"[HALT] Step {step} — flux cost {flux_cost.item():.4f} exceeds dynamic budget {self.flux_budget:.4f}")
                 break
 
             # === Hidden state for self-modeling ===
@@ -426,21 +437,10 @@ class EnhancedResonantTransformer(nn.Module):
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
-        # === Regeneration based on inverse flux ===
-        # Use the final flux cost from the last iteration
-        last_cost = self.last_flux_cost if hasattr(self, 'last_flux_cost') else 0.0
-        regen = self.regen_rate_scale * max(0.0, 1.0 - last_cost)
-        self.flux_budget = min(self.max_flux_budget, self.flux_budget + regen)
-        print(f" regen - LAST COST: {last_cost} | REGEN: {regen}")
-
         if training_was_enabled:
             self.train()        
         
         return logits, hidden
-    
-
-    def reset_flux_budget(self):
-        self.flux_budget = self.max_flux_budget
 
 
 
