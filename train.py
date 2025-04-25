@@ -277,6 +277,11 @@ for epoch in range(num_epochs):
             steps = getattr(model, "last_recursive_steps", 0)
             logits = logits[:,:inp.size(1)]
             primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
+
+            # Create dummy connection between primary and _res_tokens_for_ri
+            if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                primary = primary + 0.0 * model._res_tokens_for_ri.sum()
+
         # — Surprisal‑drop reward (normalized, clipped, baselined) —
         if not baseline:
             lp  = F.log_softmax(logits, dim=-1)
