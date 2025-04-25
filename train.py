@@ -15,6 +15,7 @@ from collections import deque
 import pandas as pd
 import plotly.express as px
 import time
+from torch.amp import autocast, GradScaler
 
 def collate_dynamic(batch):
     lengths = [len(x) for x in batch]
@@ -153,6 +154,8 @@ model.train()
 
 torch.autograd.set_detect_anomaly(True)
 
+scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+
 print("Add Resonant Token Parameters")
 
 # — Prepare a precise set of only the resonant‑token params for inner updates —
@@ -255,14 +258,14 @@ for epoch in range(num_epochs):
         ctx = ctx.to(DEVICE)
         padding_mask = padding_mask.to(DEVICE)
 
-        if not baseline:
-            logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
-        else:
-            logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
-        steps = getattr(model, "last_recursive_steps", 0)
-        logits = logits[:,:inp.size(1)]
-        # Primary loss (CE)
-        primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
+        with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
+            if not baseline:
+                logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
+            else:
+                logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
+            steps = getattr(model, "last_recursive_steps", 0)
+            logits = logits[:,:inp.size(1)]
+            primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
         # — Surprisal‑drop reward (normalized, clipped, baselined) —
         if not baseline:
             lp  = F.log_softmax(logits, dim=-1)
@@ -448,8 +451,9 @@ for epoch in range(num_epochs):
 
                 token_loss = term1 + term2 + dvt
                 opt.zero_grad()
-                token_loss.backward()
-                opt.step()
+                scaler.scale(final).backward()
+                scaler.step(opt) 
+                scaler.update()
 
             # 3) unfreeze everything
             for p in model.parameters():
