@@ -125,8 +125,8 @@ class CustomTransformerEncoderLayer(nn.Module):
 
 class EnhancedResonantTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers,
+                 baseline=False,
                  resonant_token_count=0, dynamic_resonant_token_count=0,
-                 hidden_dim=128,
                  multihead=False,
                  max_recursive_steps: int = 3):
         super().__init__()
@@ -147,6 +147,15 @@ class EnhancedResonantTransformer(nn.Module):
         self.self_model = SelfModel(hidden_size=self.d_model, depth=3)
         self.self_model_loss_fn = nn.MSELoss()
         self._res_tokens_for_ri = None
+
+        self.max_flux_budget = 1.0
+        self.flux_budget = self.max_flux_budget
+        self.regen_rate_scale = 0.1  # α in the formula
+
+        self.entropy_ema = torch.tensor(1.0)
+        self.attn_kl_ema = torch.tensor(1.0)
+        self.resolution_ema = torch.tensor(1.0)
+        self.ema_alpha = 0.01  # You can tune this, but it's stable and general
 
 
         if self.dynamic_resonant_token_count > 0:
@@ -276,6 +285,8 @@ class EnhancedResonantTransformer(nn.Module):
         resolution_scores = []
         past_internal_states = []
 
+        resolution_score = None
+
         previous_entropy = None
         previous_attention = None
         previous_resolution = None
@@ -301,6 +312,7 @@ class EnhancedResonantTransformer(nn.Module):
             # === Attention KL divergence ===
             if previous_attention is not None and attn_maps:
                 current_attn = attn_maps[-1]
+                self.attention_trajectory.append(current_attn.mean().item())
                 kl = torch.nn.functional.kl_div(
                     torch.log_softmax(current_attn, dim=-1),
                     torch.softmax(previous_attention, dim=-1),
@@ -309,21 +321,50 @@ class EnhancedResonantTransformer(nn.Module):
                 attention_kls.append(kl)
             if attn_maps:
                 previous_attention = attn_maps[-1]
+                self.attention_trajectory.append(previous_attention.mean().item())
 
-            # === Resolution score tracking ===
-            res_norms = res.norm(dim=-1)  # (batch, token_count)
-            resolution_score = res_norms.mean()
-            resolution_scores.append(resolution_score)
-            # —– convergence check on raw res —–
-            if previous_resolution is None:
+            if step == 0:
                 previous_resolution = res.detach()
+                resolution_score = torch.tensor(0.0, device=res.device)
             else:
-                # mean L2‐distance across all tokens
-                delta = (res - previous_resolution).norm(dim=-1).mean().item()
+                resolution_score = torch.norm(res - previous_resolution, dim=-1).mean()
+                previous_resolution = res.detach()
+
+                delta = resolution_score.item()
                 if delta < tol:
                     print(f"Converged early at step {step}: Δres={delta:.2e} < tol={tol}")
                     break
-                previous_resolution = res.detach()
+
+            resolution_scores.append(resolution_score)
+            self.resolution_score = resolution_score
+
+            eps = 1e-8  # Prevent divide-by-zero
+
+            # --- Get raw values ---
+            entropy_raw = entropy_deltas[-1] if entropy_deltas else torch.tensor(0.0, device=x.device)
+            attn_raw = attention_kls[-1] if attention_kls else torch.tensor(0.0, device=x.device)
+            res_raw = torch.abs(resolution_score - previous_resolution) if previous_resolution is not None else torch.tensor(0.0, device=x.device)
+
+            # --- Update EMAs ---
+            self.entropy_ema = (1 - self.ema_alpha) * self.entropy_ema + self.ema_alpha * entropy_raw.detach()
+            self.attn_kl_ema = (1 - self.ema_alpha) * self.attn_kl_ema + self.ema_alpha * attn_raw.detach()
+            self.resolution_ema = (1 - self.ema_alpha) * self.resolution_ema + self.ema_alpha * res_raw.detach()
+
+            # --- Compute normalized flux terms ---
+            norm_entropy = torch.abs(entropy_raw - self.entropy_ema) / (self.entropy_ema + eps)
+            norm_attn = torch.abs(attn_raw - self.attn_kl_ema) / (self.attn_kl_ema + eps)
+            norm_res = torch.abs(res_raw - self.resolution_ema) / (self.resolution_ema + eps)
+
+            flux_cost = norm_entropy + norm_attn + norm_res
+            flux_cost = flux_cost.mean()
+
+            self.flux_budget -= flux_cost.item()
+            self.last_flux_cost = flux_cost.item()
+
+            print(f" - RES: {resolution_score:.2e} | FCOST {flux_cost:.2e} | FBUDG: {self.flux_budget:.2e}")
+
+            if self.flux_budget <= 0:
+                break
 
             # === Hidden state for self-modeling ===
             past_internal_states.append(hidden[:, 0, :].detach())
@@ -385,10 +426,22 @@ class EnhancedResonantTransformer(nn.Module):
             else:
                 self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
 
+        # === Regeneration based on inverse flux ===
+        # Use the final flux cost from the last iteration
+        last_cost = self.last_flux_cost if hasattr(self, 'last_flux_cost') else 0.0
+        regen = self.regen_rate_scale * max(0.0, 1.0 - last_cost)
+        self.flux_budget = min(self.max_flux_budget, self.flux_budget + regen)
+        print(f" regen - LAST COST: {last_cost} | REGEN: {regen}")
+
         if training_was_enabled:
             self.train()        
         
         return logits, hidden
+    
+
+    def reset_flux_budget(self):
+        self.flux_budget = self.max_flux_budget
+
 
 
 

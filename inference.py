@@ -40,7 +40,7 @@ sequence_length = model_config["sequence_length"]  # Can be inferred/stored if d
 
 # Instantiate model using saved config
 model = EnhancedResonantTransformer(
-    # baseline=model_config["baseline"],
+    baseline=model_config["baseline"] if hasattr(model_config, "baseline") else False,
     vocab_size=model_config["vocab_size"],
     d_model=model_config["d_model"],
     num_heads=model_config["num_heads"],
@@ -78,8 +78,8 @@ while True:
         for _ in range(100):
             input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long) \
                                 .unsqueeze(0).to(DEVICE)
-            baseline = True
             if not baseline:
+                model.reset_flux_budget()
                 logits, _ = model.recursive_forward(input_seq, tol=recursive_convergence_tolerance)
             else:
                 logits, _, _, _ = model.forward(input_seq)

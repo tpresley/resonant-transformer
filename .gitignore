@@ -3,3 +3,4 @@ tokenizer-*
 *_cached.txt
 wandb/*
 __pycache__/*
+.DS_Store
