@@ -7,10 +7,10 @@
 baseline=False
 
 d_model = 512
-num_heads = 4
-num_layers = 4
-sequence_length = 384
-max_tokens = 5_000_000
+num_heads = 8
+num_layers = 6
+sequence_length = 128
+max_tokens = 100_000_000
 learning_rate = 1e-4
 batch_size = 64
 num_epochs = 50
@@ -23,10 +23,10 @@ num_epochs = 50
 # Number of Static Resonant Tokens (zero to disable)
 resonant_token_count = 4
 # Number of Dynamic Resonant Tokens to use (zero to disable)
-dynamic_resonant_token_count = 4
+dynamic_resonant_token_count = 2
 # How many epochs in the beginning to prevent Resonant Tokens
 # from influencing model weights (helps prevent collapse from early misalignment)
-warmup_epochs = 0
+warmup_epochs = 5
 # Multiple over the standard model learning to amplify learning in reonant tokens
 token_learning_amplifier = 5
 # Scalar controlling how strongly resonant tokens are optimized to align with
