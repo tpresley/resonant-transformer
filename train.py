@@ -334,8 +334,8 @@ for epoch in range(num_epochs):
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
             # compute contrastive logits via recursive inference
-            contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
-            contrast_logits = contrast_logits.detach()  # <---- KEY FIX
+            with torch.no_grad():
+                contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
             con = contrastive_loss(logits, contrast_logits)
             primary = primary + con
         else:

@@ -285,7 +285,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
-    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None):
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None, inference_mode=False):
         """
         Full recursive inference with:
         - entropy / resolution / attention tracking
@@ -293,6 +293,12 @@ class EnhancedResonantTransformer(nn.Module):
         - RAF modulation
         - adaptive early halting (via tolerance)
         """
+
+        if inference_mode:
+            training_was_enabled = self.training
+            self.eval()
+            torch.set_grad_enabled(False)
+
         training_was_enabled = self.training
         self.eval()
 
@@ -463,6 +469,10 @@ class EnhancedResonantTransformer(nn.Module):
         if training_was_enabled:
             self.train()        
         
+        if inference_mode and training_was_enabled:
+            self.train()
+            torch.set_grad_enabled(True)
+
         return logits, hidden, total_flux_penalty
 
 
