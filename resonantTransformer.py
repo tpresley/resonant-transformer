@@ -223,7 +223,7 @@ class EnhancedResonantTransformer(nn.Module):
         # Gather resonant token sources
         res_list = []
         if self.static_resonant_token_count > 0:
-            static = self.resonant_tokens.expand(B, -1, -1)
+            static = self.resonant_tokens.expand(B, -1, -1).clone()
             res_list.append(static)
         if self.dynamic_resonant_token_count > 0:
             dyn = self.controller(context_vec)
