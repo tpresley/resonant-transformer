@@ -333,11 +333,10 @@ for epoch in range(num_epochs):
         if not baseline:
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
-            # compute contrastive logits via recursive inference
+            # compute contrastive logits separately, no autograd tracking
             with torch.no_grad():
                 contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
-            con = contrastive_loss(logits, contrast_logits)
-            primary = primary + con
+                con = contrastive_loss(logits, contrast_logits)
         else:
             con = torch.tensor(0.0, device=DEVICE)
 
@@ -381,7 +380,7 @@ for epoch in range(num_epochs):
         if not baseline:
             term4 = flux_penalty_weight * flux_penalty
         
-        final = primary - term1 - term2 + term3 + term4 + dvt
+        final = (primary - term1 - term2 + term3 + term4 + dvt) + con
 
         # Backprop the full loss
         opt.zero_grad()
