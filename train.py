@@ -79,14 +79,25 @@ print("Tokenizer Setup")
 
 # Tokenizer setup
 tokenizer_dir = "tokenizer-tinystories"
-if not os.path.exists(tokenizer_dir):
+vocab_path = os.path.join(tokenizer_dir, "vocab.json")
+merges_path = os.path.join(tokenizer_dir, "merges.txt")
+
+# Check if both vocab and merges files exist
+if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
+    print("[Tokenizer] Training new tokenizer...")
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train(
         files=[corpus_path],
-        vocab_size=16000, min_frequency=2, special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"])
+        vocab_size=16000,
+        min_frequency=2,
+        special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
+    )
+    os.makedirs(tokenizer_dir, exist_ok=True)
     tokenizer.save_model(tokenizer_dir)
 else:
-    tokenizer = ByteLevelBPETokenizer(f"{tokenizer_dir}/vocab.json", f"{tokenizer_dir}/merges.txt")
+    print("[Tokenizer] Loading existing tokenizer...")
+    tokenizer = ByteLevelBPETokenizer()
+    tokenizer.from_file(vocab_path, merges_path)
 
 tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
 pad_id = tokenizer.token_to_id("<pad>")
