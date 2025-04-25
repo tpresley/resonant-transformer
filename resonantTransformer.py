@@ -320,6 +320,8 @@ class EnhancedResonantTransformer(nn.Module):
 
         self.last_recursive_steps = 1
 
+        total_flux_penalty = torch.tensor(0.0, device=x.device)  # Accumulate excess flux
+
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
@@ -381,8 +383,6 @@ class EnhancedResonantTransformer(nn.Module):
             flux_cost = norm_entropy + norm_attn + norm_res
             flux_cost = flux_cost.mean()
 
-            # Clamp cost and enforce non-negative budget
-            capped_cost = min(flux_cost.item(), 2.0)  # Cap optional
             # === Self-calibrate dynamic flux budget ===
             if self.budget_ema is None:
                 self.budget_ema = flux_cost.item()
@@ -393,10 +393,12 @@ class EnhancedResonantTransformer(nn.Module):
 
             self.last_flux_cost = flux_cost.item()
 
-            # === Fatigue check based on adaptive budget ===
-            if flux_cost.item() > self.flux_budget:
-                print(f"[HALT] Step {step} — flux cost {flux_cost.item():.4f} exceeds dynamic budget {self.flux_budget:.4f}")
-                break
+            # === Soft penalty instead of hard cutoff ===
+            excess_flux = flux_cost - self.flux_budget
+            excess_flux_penalty = torch.relu(excess_flux)
+            if excess_flux_penalty.item() > 0:
+                print(f"[FLUX PENALTY] Step {step} — {excess_flux.item():.4f} over budget ({self.flux_budget:.4f})")
+            total_flux_penalty += excess_flux_penalty
 
             # === Hidden state for self-modeling ===
             past_internal_states.append(hidden[:, 0, :].detach())
@@ -461,7 +463,7 @@ class EnhancedResonantTransformer(nn.Module):
         if training_was_enabled:
             self.train()        
         
-        return logits, hidden
+        return logits, hidden, total_flux_penalty
 
 
 

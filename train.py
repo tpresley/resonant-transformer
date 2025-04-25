@@ -35,7 +35,8 @@ from config import (
     lambda_sur, lambda_attn, lambda_res,
     multihead_resonance,
     max_recursive_steps,
-    recursive_convergence_tolerance
+    recursive_convergence_tolerance,
+    flux_penalty_weight
 )
 
 if baseline:
@@ -255,7 +256,7 @@ for epoch in range(num_epochs):
         padding_mask = padding_mask.to(DEVICE)
 
         if not baseline:
-            logits, res = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
+            logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
         else:
             logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
         steps = getattr(model, "last_recursive_steps", 0)
@@ -319,7 +320,7 @@ for epoch in range(num_epochs):
             ci = inp.clone()
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
             # compute contrastive logits via recursive inference
-            contrast_logits, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
+            contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
             con = contrastive_loss(logits, contrast_logits)
             primary = primary + con
         else:
@@ -361,8 +362,11 @@ for epoch in range(num_epochs):
         if hasattr(model, 'last_self_model_loss'):
             term3 = model.last_self_model_loss * self_model_loss_weight
         
+        # adjust loss for flux (cognitive fatigue)
+        if not baseline:
+            term4 = flux_penalty_weight * flux_penalty
         
-        final = primary - term1 - term2 + term3 + dvt
+        final = primary - term1 - term2 + term3 + term4 + dvt
 
         # Backprop the full loss
         opt.zero_grad()
@@ -416,7 +420,7 @@ for epoch in range(num_epochs):
             for _ in range(5):
 
                 # recompute primary to get a fresh autograd graph
-                logits, res = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
+                logits, res, flux_penalty = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
                 logits = logits[:, :inp.size(1), :]
                 primary_inner = crit(
                     logits.reshape(-1, logits.size(-1)),

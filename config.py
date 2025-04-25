@@ -46,3 +46,4 @@ lambda_res = 0.05      # resolution-coherence weight
 multihead_resonance = True  # boolean flag for multihead resonance
 max_recursive_steps = 5
 recursive_convergence_tolerance = 1e-5
+flux_penalty_weight = 0.01
