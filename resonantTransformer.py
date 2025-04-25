@@ -255,7 +255,7 @@ class EnhancedResonantTransformer(nn.Module):
             if self.training:
                 self._res_tokens_for_ri = tokens.detach().requires_grad_(True)
             else:
-                self._res_tokens_for_ri = tokens
+                self._res_tokens_for_ri = tokens.requires_grad_()
             if tokens.requires_grad:
                 tokens.retain_grad()
 
