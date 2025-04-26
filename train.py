@@ -402,10 +402,11 @@ for epoch in range(num_epochs):
 
             # === Pro-mode batching ===
             gn = gr.norm(dim=-1).clamp(min=1e-6)
+            diversity_weight = min(lambda_div * (epoch / num_epochs), lambda_div)
             penalty = (
                 lambda_ri * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
                 + lambda_rs * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-                + lambda_div * diversity_penalty(model._res_tokens_for_ri)
+                + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
             )
         else:
             term1 = term2 = dvt = torch.tensor(0.0, device=DEVICE)

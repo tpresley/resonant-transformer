@@ -539,15 +539,22 @@ def inject_resonant_noise(tokens, noise_level=0.1):
 
 def diversity_penalty(x):
     """
-    x: tensor of shape [batch, tokens, dim]
-    returns a scalar penalty encouraging diversity between tokens
+    x: [batch, tokens, dim]
+    Computes penalty encouraging tokens to be orthogonal and diverse.
     """
-    normed = F.normalize(x, dim=-1, eps=1e-6)  # <<== small epsilon prevents division by zero
-    sim_matrix = torch.einsum('btd,bkd->btk', normed, normed)  # batch matrix multiplication
-    batch_size, num_tokens, _ = sim_matrix.shape
-    mask = torch.eye(num_tokens, device=sim_matrix.device).bool().unsqueeze(0)
+    x = F.normalize(x, dim=-1, eps=1e-6)  # Normalize each token vector
+    batch_size, num_tokens, dim = x.size()
+
+    # Compute cosine similarity matrix
+    sim_matrix = torch.einsum('btd,bkd->btk', x, x)  # [batch, tokens, tokens]
+
+    # Zero out the diagonal (self-similarity)
+    mask = torch.eye(num_tokens, device=x.device).bool().unsqueeze(0)  # [1, tokens, tokens]
     sim_matrix.masked_fill_(mask, 0.0)
-    penalty = sim_matrix.abs().mean()
+
+    # Square similarities to punish high overlap strongly
+    penalty = (sim_matrix ** 2).mean()
+
     return penalty
 
 def cosine_rampup(t, warmup_epochs):
