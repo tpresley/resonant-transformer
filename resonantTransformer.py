@@ -328,7 +328,7 @@ class EnhancedResonantTransformer(nn.Module):
         attn_maps = None
 
         self.last_recursive_steps = 1
-        self.excess_flux_count = 0
+        # self.excess_flux_count = 0
 
         total_flux_penalty = torch.tensor(0.0, device=x.device)  # Accumulate excess flux
 

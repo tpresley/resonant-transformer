@@ -278,6 +278,8 @@ for epoch in range(num_epochs):
 
     model.alpha = cosine_rampup(epoch, warmup_epochs)
     for bidx, (batch, lengths) in enumerate(loader):
+        model.excess_flux_count = 0
+
         inp = batch[:, :-1]
         inp = inp.to(DEVICE)
         tgt = batch[:, 1:]
