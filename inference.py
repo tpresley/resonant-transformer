@@ -144,8 +144,19 @@ while True:
         for current in range(100):
             input_seq = torch.tensor(generated[-(sequence_length-1):], dtype=torch.long).unsqueeze(0).to(DEVICE)
 
-            # === Correct padding mask building ===
             dynamic_res_tokens = getattr(model, "dynamic_resonant_token_count", 0)
+
+            # Prepend dummy tokens for dynamic resonant tokens
+            if dynamic_res_tokens > 0:
+                prepend = torch.full(
+                    (input_seq.size(0), dynamic_res_tokens),
+                    pad_id,
+                    dtype=input_seq.dtype,
+                    device=input_seq.device
+                )
+                input_seq = torch.cat([prepend, input_seq], dim=1)
+
+            # === Correct padding mask building ===
             padding_mask = prepare_padding_mask(input_seq, pad_id, dynamic_res_tokens)
 
             # === Use new helper for safe context prep ===
