@@ -223,28 +223,45 @@ last_run_time = time.time()
 # Training
 for epoch in range(num_epochs):
 
-    # Disable updates to resonant token parameters during warmup
+    # === Check if we need to switch modes at start of epoch ===
+    if epoch == warmup_epochs:
+        print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
+
+        # Enable grads for resonant-related parameters
+        for p in model.parameters():
+            p.requires_grad_(True)
+
+        # Rebuild optimizer including resonant tokens
+        param_groups = [
+            {
+                'params': [p for n, p in model.named_parameters()
+                           if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+                'lr': learning_rate
+            }
+        ]
+        if resonant_token_count > 0:
+            param_groups.append({
+                'params': [model.resonant_tokens],
+                'lr': learning_rate * token_learning_amplifier
+            })
+        if dynamic_resonant_token_count > 0:
+            param_groups.append({
+                'params': model.controller.parameters(),
+                'lr': learning_rate * token_learning_amplifier
+            })
+        if multihead_resonance:
+            param_groups.append({
+                'params': model.resonator.parameters(),
+                'lr': learning_rate * token_learning_amplifier
+            })
+
+        opt = torch.optim.Adam(param_groups)
+
+    # If still in warmup, freeze resonant parameters
     if epoch < warmup_epochs:
         for p in inner_res_params:
-            p.requires_grad = False
-    else:
-        for p in inner_res_params:
-            p.requires_grad = True
+            p.requires_grad_(False)
 
-    # === Rebuild optimizer at end of warmup to include resonant params ===
-    if epoch == warmup_epochs:
-        print(f"Rebuilding optimizer at epoch {epoch}")
-        opt = torch.optim.Adam([
-            {'params': [p for n, p in model.named_parameters()
-                        if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
-             'lr': learning_rate},
-            {'params': [model.resonant_tokens],
-             'lr': learning_rate * token_learning_amplifier},
-            {'params': model.controller.parameters(),
-             'lr': learning_rate * token_learning_amplifier},
-            {'params': model.resonator.parameters(),
-             'lr': learning_rate * token_learning_amplifier}
-        ])
 
     # Rebuild fresh references to resonant-token parameters
     inner_res_params = set()
