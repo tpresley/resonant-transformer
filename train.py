@@ -24,6 +24,24 @@ def collate_dynamic(batch):
     padded = [x + [pad_id] * (max_len - len(x)) for x in batch]
     return torch.tensor(padded, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
 
+def soft_project_onto_hypersphere(x, target_radius=1.0, tolerance=0.25, strength=0.1, eps=1e-6):
+    """
+    Softly nudges x toward a hypersphere of radius `target_radius`.
+    
+    Args:
+        x: input tensor [..., d]
+        target_radius: desired norm
+        tolerance: allowed deviation before correction
+        strength: interpolation factor (0 = no correction, 1 = hard projection)
+    """
+    norms = x.norm(dim=-1, keepdim=True).clamp(min=eps)
+    deviation = (norms - target_radius).abs()
+
+    mask = (deviation > tolerance).float()  # Only correct if deviation is large
+    corrected = target_radius * (x / norms)
+
+    return x * (1 - strength * mask) + corrected * (strength * mask)
+
 # === Hyperparameters & Config ===
 from config import (
     baseline,
@@ -299,6 +317,20 @@ for epoch in range(num_epochs):
 
         ctx = ctx.to(DEVICE)
         padding_mask = padding_mask.to(DEVICE)
+
+        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            if torch.isnan(model._res_tokens_for_ri).any():
+                print("[train.py] WARNING: NaNs detected in model._res_tokens_for_ri! Repairing...")
+                with torch.no_grad():
+                    model._res_tokens_for_ri.data = torch.nan_to_num(model._res_tokens_for_ri.data, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Soft project to maintain healthy norms
+            with torch.no_grad():
+                model._res_tokens_for_ri.data = soft_project_onto_hypersphere(
+                    model._res_tokens_for_ri.data,
+                    target_radius=0.5,   # consistent with your normal scaling
+                    tolerance=0.25,      # allow some breathing room
+                    strength=0.1         # gentle nudge
+                )
 
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
             if not baseline:

@@ -543,22 +543,19 @@ def diversity_penalty(x):
     x: [batch, tokens, dim]
     Computes penalty encouraging tokens to be orthogonal and diverse.
     """
+    if torch.isnan(x).any():
+        print("[diversity_penalty] WARNING: NaNs detected in resonant tokens! Repairing...")
+        with torch.no_grad():
+            x.data = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+
     x = F.normalize(x, dim=-1, eps=1e-6)  # Normalize each token vector
     batch_size, num_tokens, dim = x.size()
 
-    # === NAN DETECTION ===
-    if torch.isnan(x).any():
-        print("[diversity_penalty] WARNING: NaNs detected in resonant tokens!")
-        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
-
     sim_matrix = torch.einsum('btd,bkd->btk', x, x)  # [batch, tokens, tokens]
-
     mask = torch.eye(num_tokens, device=x.device).bool().unsqueeze(0)  # [1, tokens, tokens]
     sim_matrix.masked_fill_(mask, 0.0)
 
-    # Square similarities to punish high overlap strongly
     penalty = (sim_matrix ** 2).mean()
-
     return penalty
 
 def cosine_rampup(t, warmup_epochs):
