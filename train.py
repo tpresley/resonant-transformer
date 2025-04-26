@@ -359,23 +359,33 @@ for epoch in range(num_epochs):
         term1 = term2 = term3 = 0.0
         dvt   = torch.tensor(0.0, device=DEVICE)
         if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
-            # compute gradient w.r.t. the resonant tokens (may be None if unused)
+            # === New better way: Partial backward first ===
+            if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                # Inject dummy link
+                primary = primary + 0.0 * model._res_tokens_for_ri.sum()
+
+            opt.zero_grad(set_to_none=True)
+        # === Correct way: use autograd.grad for resonant grads ===
+        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
             grad_tuple = torch.autograd.grad(
                 primary, model._res_tokens_for_ri,
                 retain_graph=True,
-                create_graph=False,
+                create_graph=True,
                 allow_unused=True
             )
             gr = grad_tuple[0]
             if gr is None:
-                # no gradient flowed—use zeros
                 gr = torch.zeros_like(model._res_tokens_for_ri)
-            gn    = gr.norm(dim=-1).clamp(min=1e-6)
-            ri_v  = (gr * model._res_tokens_for_ri).sum(dim=-1).abs() / gn
-            term1 = lambda_ri * ri_v.mean()
-            rs_v  = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-            term2 = lambda_rs * rs_v.mean()
-            dvt   = lambda_div * diversity_penalty(model._res_tokens_for_ri)
+
+            # === Pro-mode batching ===
+            gn = gr.norm(dim=-1).clamp(min=1e-6)
+            penalty = (
+                lambda_ri * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
+                + lambda_rs * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
+                + lambda_div * diversity_penalty(model._res_tokens_for_ri)
+            )
+        else:
+            term1 = term2 = dvt = torch.tensor(0.0, device=DEVICE)
         
         self_model_loss_weight = 0.1
         if hasattr(model, 'last_self_model_loss'):
@@ -384,8 +394,12 @@ for epoch in range(num_epochs):
         # adjust loss for flux (cognitive fatigue)
         if not baseline:
             term4 = flux_penalty_weight * flux_penalty
+
+        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            model._res_tokens_for_ri.grad = None
+
         
-        final = (primary - term1 - term2 + term3 + term4 + dvt) + con
+        final = (primary - penalty + term3 + term4) + con
 
         # Backprop the full loss
         opt.zero_grad()
