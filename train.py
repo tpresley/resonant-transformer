@@ -257,6 +257,11 @@ for epoch in range(num_epochs):
 
         opt = torch.optim.Adam(param_groups)
 
+        # === Force a refresh of _res_tokens_for_ri ===
+        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            with torch.no_grad():
+                model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
+
     # If still in warmup, freeze resonant parameters
     if epoch < warmup_epochs:
         for p in inner_res_params:
