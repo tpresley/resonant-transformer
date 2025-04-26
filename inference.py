@@ -69,10 +69,10 @@ sequence_length = model_config["sequence_length"]  # Can be inferred/stored if d
 model = EnhancedResonantTransformer(
     baseline=model_config["baseline"] if hasattr(model_config, "baseline") else False,
     vocab_size=model_config["vocab_size"],
-    sequence_length=model_config["sequence_length"],
-    max_tokens=model_config["max_tokens"],
-    learning_rate=model_config["learning_rate"],
-    batch_size=model_config["batch_size"],
+    # sequence_length=model_config["sequence_length"],
+    # max_tokens=model_config["max_tokens"],
+    # learning_rate=model_config["learning_rate"],
+    # batch_size=model_config["batch_size"],
     d_model=model_config["d_model"],
     num_heads=model_config["num_heads"],
     num_layers=model_config["num_layers"],
@@ -80,7 +80,7 @@ model = EnhancedResonantTransformer(
     dynamic_resonant_token_count=model_config["dynamic_resonant_token_count"],
     multihead=model_config.get("multihead", False),
     max_recursive_steps=model_config["max_recursive_steps"] if hasattr(model_config, "max_recursive_steps") else 5,
-    flux_penalty_weight=model_config["flux_penalty_weight"]
+    # flux_penalty_weight=model_config["flux_penalty_weight"]
 )
 # Resize saved context to match inference-time batch size
 if resonant_context is not None:
