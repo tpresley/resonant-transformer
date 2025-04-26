@@ -33,17 +33,14 @@ def prepare_context(model: nn.Module, input_seq: torch.Tensor) -> torch.Tensor:
 
     return context
 
-def prepare_padding_mask(input_seq: torch.Tensor, pad_id: int, dynamic_res_tokens: int) -> torch.Tensor:
+def prepare_padding_mask(input_seq: torch.Tensor, pad_id: int, num_extra_tokens: int) -> torch.Tensor:
     """
-    Builds padding mask correctly for input_seq, accounting for dynamic resonant tokens.
-    No self-token prepended manually here.
+    Builds padding mask correctly for input_seq, accounting for self-token and all resonant tokens.
     """
-    # Start with base mask (input tokens)
     padding_mask = (input_seq == pad_id)
 
-    # Prepend extra False for dynamic resonant tokens
-    if dynamic_res_tokens > 0:
-        extra = torch.zeros((padding_mask.size(0), dynamic_res_tokens), dtype=torch.bool, device=padding_mask.device)
+    if num_extra_tokens > 0:
+        extra = torch.zeros((padding_mask.size(0), num_extra_tokens), dtype=torch.bool, device=padding_mask.device)
         padding_mask = torch.cat([extra, padding_mask], dim=1)
 
     return padding_mask
@@ -139,12 +136,18 @@ while True:
         for current in range(100):
             input_seq = torch.tensor(generated[-(sequence_length-1):], dtype=torch.long).unsqueeze(0).to(DEVICE)
 
+            # Compute number of extra tokens
+            static_res_tokens = getattr(model, "static_resonant_token_count", 0)
             dynamic_res_tokens = getattr(model, "dynamic_resonant_token_count", 0)
+            multihead_enabled = getattr(model, "multihead", False)
+            multihead_tokens = static_res_tokens if multihead_enabled else 0  # If multihead=True, use static_resonant_token_count
 
-            # Prepend dummy tokens for dynamic resonant tokens
-            if dynamic_res_tokens > 0:
+            num_extra_tokens = 1 + static_res_tokens + dynamic_res_tokens + multihead_tokens  # 1 for self-token
+
+            # Prepend dummy tokens for all extra tokens
+            if num_extra_tokens > 0:
                 prepend = torch.full(
-                    (input_seq.size(0), dynamic_res_tokens),
+                    (input_seq.size(0), num_extra_tokens),
                     pad_id,
                     dtype=input_seq.dtype,
                     device=input_seq.device
@@ -152,7 +155,8 @@ while True:
                 input_seq = torch.cat([prepend, input_seq], dim=1)
 
             # === Correct padding mask building ===
-            padding_mask = prepare_padding_mask(input_seq, pad_id, dynamic_res_tokens)
+            padding_mask = prepare_padding_mask(input_seq, pad_id, 0)  # Already included prepended tokens
+
 
             # === Use new helper for safe context prep ===
             context = prepare_context(model, input_seq)
