@@ -1,11 +1,37 @@
 import os
 import torch
+from torch import nn  # needed for the helper
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from resonantTransformer import EnhancedResonantTransformer
 from config import recursive_convergence_tolerance, baseline
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def prepare_context(model: nn.Module, input_seq: torch.Tensor) -> torch.Tensor:
+    """
+    Prepare the context vector for inference, matching training behavior.
+    Handles global_res or self_token fallback, and ensures dimension correctness.
+    """
+    if getattr(model, "global_res", None) is not None:
+        if model.global_res.dim() == 3:
+            context = model.global_res.mean(dim=1)  # [batch, d_model]
+        elif model.global_res.dim() == 2:
+            context = model.global_res  # [batch, d_model]
+        else:
+            raise ValueError(f"[prepare_context] Unexpected global_res shape: {model.global_res.shape}")
+
+        # Safety check: context must match d_model
+        assert context.size(-1) == model.d_model, \
+            f"[prepare_context] Context size mismatch: got {context.size(-1)}, expected {model.d_model}"
+
+        # Expand for batch
+        context = context.expand(input_seq.size(0), -1).contiguous()
+    else:
+        # fallback to self_token mean
+        context = model.self_token.expand(input_seq.size(0), -1, -1).mean(dim=1)
+
+    return context
 
 # List .pt files
 pt_files = [f for f in os.listdir('.') if f.endswith('.pt')]
@@ -82,7 +108,7 @@ while True:
     # === Encode with <bos> and <eos> ===
     encoded = tokenizer.encode(user_input)
     tokens = [bos_id] + encoded.ids
-    tokens = tokens[:sequence_length - 1]
+    tokens = tokens[:sequence_length - 1]  # reserve 1 slot for self-token
     input_length = len(tokens)
     if input_length < (sequence_length - 1):
         tokens += [pad_id] * ((sequence_length - 1) - len(tokens))
@@ -90,9 +116,15 @@ while True:
     generated = tokens[:]
     with torch.no_grad():
         for current in range(100):
-            input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long).unsqueeze(0).to(DEVICE)
-            # build padding mask for input
+            input_seq = torch.tensor(generated[-(sequence_length-1):], dtype=torch.long).unsqueeze(0).to(DEVICE)
+
+            # === Build correct padding mask with self-token accounted ===
             padding_mask = (input_seq == pad_id)
+            padding_mask = torch.cat(
+                [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
+                 padding_mask],
+                dim=1
+            )
 
             # === CORRECT padding mask adjustment ===
             # we need to account for +1 self-token
@@ -103,11 +135,8 @@ while True:
                 dim=1
             )
 
-            # === Match training context derivation ===
-            if model.global_res is not None:
-                context = model.global_res.mean(dim=1).expand(input_seq.size(0), -1).contiguous()
-            else:
-                context = model.self_token.expand(input_seq.size(0), -1, -1).mean(dim=1)
+            # === Use new helper for safe context prep ===
+            context = prepare_context(model, input_seq)
 
             if not baseline:
                 logits, _ = model.recursive_forward(
