@@ -338,7 +338,7 @@ for epoch in range(num_epochs):
                 # === Fix flux_penalty to safe float32 outside autocast ===
                 flux_penalty = flux_penalty.to(torch.float32)
             else:
-                logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
+                logits, res, _, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
             steps = getattr(model, "last_recursive_steps", 0)
             logits = logits[:,:inp.size(1)]
             primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
@@ -465,7 +465,7 @@ for epoch in range(num_epochs):
             model._res_tokens_for_ri.grad = None
 
         
-        final = (primary - penalty + term3 + term4) + con
+        final = (primary - penalty + term3 + term4) + con if not baseline else primary
 
         # === ADDITION: small constant diversity encouragement every batch ===
         if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:

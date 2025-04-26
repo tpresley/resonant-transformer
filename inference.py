@@ -169,7 +169,7 @@ while True:
                     padding_mask=padding_mask
                 )
             else:
-                logits, _, _, _ = model.forward(input_seq, context=context, padding_mask=padding_mask)
+                logits, _, _, _, _ = model.forward(input_seq, context=context, padding_mask=padding_mask)
             # 1) temperature
             temperature = 0.8
             logits = logits[0, -1]
