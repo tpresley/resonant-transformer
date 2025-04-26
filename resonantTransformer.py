@@ -545,10 +545,13 @@ def diversity_penalty(x):
     x = F.normalize(x, dim=-1, eps=1e-6)  # Normalize each token vector
     batch_size, num_tokens, dim = x.size()
 
-    # Compute cosine similarity matrix
+    # === NAN DETECTION ===
+    if torch.isnan(x).any():
+        print("[diversity_penalty] WARNING: NaNs detected in resonant tokens!")
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+
     sim_matrix = torch.einsum('btd,bkd->btk', x, x)  # [batch, tokens, tokens]
 
-    # Zero out the diagonal (self-similarity)
     mask = torch.eye(num_tokens, device=x.device).bool().unsqueeze(0)  # [1, tokens, tokens]
     sim_matrix.masked_fill_(mask, 0.0)
 

@@ -261,6 +261,14 @@ for epoch in range(num_epochs):
             with torch.no_grad():
                 model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
 
+        # === VERY IMPORTANT: clean resonant tokens ===
+        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            with torch.no_grad():
+                model._res_tokens_for_ri.clamp_(-1.0, 1.0)  # Limit to safe range
+                nan_mask = torch.isnan(model._res_tokens_for_ri)
+                model._res_tokens_for_ri[nan_mask] = 0.0  # replace any NaNs
+                model._res_tokens_for_ri.requires_grad_(True)
+
     # If still in warmup, freeze resonant parameters
     if epoch < warmup_epochs:
         for p in inner_res_params:
@@ -522,6 +530,7 @@ for epoch in range(num_epochs):
                 # === Refresh resonant token grads AFTER backward and step ===
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
                     with torch.no_grad():
+                        model._res_tokens_for_ri.clamp_(-5.0, 5.0)  # Prevent runaway magnitudes
                         model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
 
             # === After all mini-steps, refresh _res_tokens_for_ri AGAIN ===
