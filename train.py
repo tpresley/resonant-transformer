@@ -487,10 +487,6 @@ for epoch in range(num_epochs):
             res_token_norm = model._res_tokens_for_ri.norm().item()
             if hasattr(model, 'resonant_tokens'):
                 stat_norm = model.resonant_tokens.norm().item()
-            if hasattr(model, 'controller'):
-                dyn_norm = model.controller(context_vec).norm().item()
-            if hasattr(model, 'resonator'):
-                mh_norm = model.resonator(context_vec).norm().item()
             dvt = diversity_penalty(model._res_tokens_for_ri)
 
             
@@ -603,6 +599,10 @@ for epoch in range(num_epochs):
             else:
                 context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
 
+            if hasattr(model, 'controller'):
+                dyn_norm = model.controller(context_vec).norm().item()
+            if hasattr(model, 'resonator'):
+                mh_norm = model.resonator(context_vec).norm().item()
 
             if (resonant_token_count + dynamic_resonant_token_count) == 0:
                 val_ri = 0.0
