@@ -4,15 +4,17 @@
 # Standard Hyperparameters
 #####
 
-baseline=False
+baseline=True
 
-d_model = 512
-num_heads = 8
+d_model = 256
+num_heads = 4
 num_layers = 6
+vocab_size = 1024
 sequence_length = 128
-max_tokens = 100_000_000
-learning_rate = 1e-4
-batch_size = 64
+max_tokens = 5_000_000
+learning_rate = 2e-4
+weight_decay = 0.01
+batch_size = 512
 num_epochs = 50
 
 

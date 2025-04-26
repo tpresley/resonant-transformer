@@ -45,7 +45,7 @@ def soft_project_onto_hypersphere(x, target_radius=1.0, tolerance=0.25, strength
 # === Hyperparameters & Config ===
 from config import (
     baseline,
-    d_model, num_heads, num_layers,
+    d_model, num_heads, num_layers, vocab_size, weight_decay,
     resonant_token_count, dynamic_resonant_token_count,
     token_learning_amplifier,
     sequence_length, max_tokens, learning_rate,
@@ -106,7 +106,7 @@ if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train(
         files=[corpus_path],
-        vocab_size=16000,
+        vocab_size=vocab_size,
         min_frequency=2,
         special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
     )
@@ -224,7 +224,8 @@ else:
         # everything else
         {'params': [p for n,p in model.named_parameters() if 'resonant_tokens' not in n
                     and 'controller' not in n and 'resonator' not in n],
-        'lr': learning_rate}
+        'lr': learning_rate,
+        'weight_decay': weight_decay}
     ])
     
 
@@ -241,7 +242,7 @@ last_run_time = time.time()
 for epoch in range(num_epochs):
 
     # === Check if we need to switch modes at start of epoch ===
-    if epoch == warmup_epochs:
+    if epoch == warmup_epochs and not baseline:
         print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
 
         # Enable grads for resonant-related parameters
