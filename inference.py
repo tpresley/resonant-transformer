@@ -110,25 +110,33 @@ while True:
                 logits, _, _, _ = model.forward(input_seq, context=context, padding_mask=padding_mask)
             # 1) temperature
             temperature = 0.8
-            probs = torch.softmax(logits[0, -1] / temperature, dim=0)
-            # 1) sort by descending probability
+            logits = logits[0, -1]
+
+            # Safe softmax
+            logits = logits / temperature
+            logits = logits - logits.max()  # subtract max for numerical stability
+            probs = torch.softmax(logits, dim=0)
+
+            # Filter out invalid tokens
+            valid_vocab_size = model.embedding.num_embeddings
+            probs = probs[:valid_vocab_size]
+
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            # 2) compute cumulative sum to do top‑p
             cum_probs = torch.cumsum(sorted_probs, dim=0)
             p = 0.9
             mask = cum_probs <= p
-            # ensure at least the highest‑prob token remains
             mask[0] = True
-            filtered = sorted_probs * mask
-            filtered_sum = filtered.sum()
-            # fallback if something went wrong (zero sum)
+            filtered_probs = sorted_probs * mask
+            filtered_sum = filtered_probs.sum()
+
             if filtered_sum <= 0 or torch.isnan(filtered_sum):
-                filtered = sorted_probs[:1]
+                filtered_probs = sorted_probs[:1]
                 sorted_indices = sorted_indices[:1]
-                filtered_sum = filtered.sum()
-            # normalize to get a valid distribution
-            filtered = filtered / filtered_sum
-            next_token = sorted_indices[torch.multinomial(filtered, 1)].item()
+                filtered_sum = filtered_probs.sum()
+
+            filtered_probs = filtered_probs / filtered_sum
+            next_token = sorted_indices[torch.multinomial(filtered_probs, 1)].item()
+
             generated.append(next_token)
             if next_token == eos_id:
                 print(f"Found EOS at token {current}")
