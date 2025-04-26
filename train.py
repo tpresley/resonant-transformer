@@ -336,6 +336,15 @@ for epoch in range(num_epochs):
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
             if not baseline:
                 logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
+
+                # Immediately repair resonant tokens if needed
+                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                    with torch.no_grad():
+                        mask = torch.isnan(model._res_tokens_for_ri)
+                        if mask.any():
+                            print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
+                            model._res_tokens_for_ri.data[mask] = 0.0  # or small random noise if you prefer
+
                 # === Fix flux_penalty to safe float32 outside autocast ===
                 flux_penalty = flux_penalty.to(torch.float32)
             else:
@@ -417,7 +426,7 @@ for epoch in range(num_epochs):
             lp_ent = F.log_softmax(logits, dim=-1)      # shape [B, L, V]
             pr_ent = lp_ent.exp()                       # shape [B, L, V]
             # entropy per token = −∑ p log p; then mean over batch & sequence
-            ent_loss = -(pr_ent * lp_ent).sum(-1).mean()  
+            ent_loss = -((pr_ent + 1e-8) * (lp_ent + 1e-8)).sum(-1).mean()
             # small weight to reward higher entropy
             primary = primary - 1e-4 * ent_loss
 
@@ -521,6 +530,15 @@ for epoch in range(num_epochs):
             for _ in range(5):
                 # Forward pass
                 logits, res, flux_penalty = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
+
+                # Immediately repair resonant tokens if needed
+                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                    with torch.no_grad():
+                        mask = torch.isnan(model._res_tokens_for_ri)
+                        if mask.any():
+                            print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
+                            model._res_tokens_for_ri.data[mask] = 0.0  # or small random noise if you prefer
+
                 logits = logits[:, :inp.size(1), :]
                 
                 primary_inner = crit(
