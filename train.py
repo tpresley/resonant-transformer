@@ -422,17 +422,9 @@ for epoch in range(num_epochs):
             primary = primary - 1e-4 * ent_loss
 
         # first build the final loss including these terms
-        term1 = term2 = term3 = 0.0
-        dvt   = torch.tensor(0.0, device=DEVICE)
-        if not baseline and res.numel() > 0 and hasattr(model, '_res_tokens_for_ri'):
-            # === New better way: Partial backward first ===
-            if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                # Inject dummy link
-                primary = primary + 0.0 * model._res_tokens_for_ri.sum()
 
-            opt.zero_grad(set_to_none=True)
-        # === Correct way: use autograd.grad for resonant grads ===
-        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+        penalty = torch.tensor(0.0, device=DEVICE)  # Safe default penalty
+        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
             grad_tuple = torch.autograd.grad(
                 primary, model._res_tokens_for_ri,
                 retain_graph=True,
@@ -440,19 +432,14 @@ for epoch in range(num_epochs):
                 allow_unused=True
             )
             gr = grad_tuple[0]
-            if gr is None:
-                gr = torch.zeros_like(model._res_tokens_for_ri)
-
-            # === Pro-mode batching ===
-            gn = gr.norm(dim=-1).clamp(min=1e-6)
-            diversity_weight = min(lambda_div * (epoch / num_epochs), lambda_div)
-            penalty = (
-                lambda_ri * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
-                + lambda_rs * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-                + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
-            )
-        else:
-            term1 = term2 = dvt = torch.tensor(0.0, device=DEVICE)
+            if gr is not None:
+                gn = gr.norm(dim=-1).clamp(min=1e-6)  # prevent div-by-zero
+                diversity_weight = min(lambda_div * (epoch / num_epochs), lambda_div)
+                penalty = (
+                    lambda_ri * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
+                    + lambda_rs * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
+                    + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
+                )
         
         self_model_loss_weight = 0.1
         if hasattr(model, 'last_self_model_loss'):
