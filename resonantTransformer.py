@@ -85,7 +85,7 @@ class CustomTransformerEncoderLayer(nn.Module):
 
         self.linear1 = LawfulLinear(d_model, dim_feedforward)
         self.linear2 = LawfulLinear(dim_feedforward, d_model)
-        self.activation = nn.ReLU()
+        self.activation = nn.GELU()
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
