@@ -35,24 +35,19 @@ def prepare_context(model: nn.Module, input_seq: torch.Tensor) -> torch.Tensor:
 
 def prepare_padding_mask(input_seq: torch.Tensor, pad_id: int, dynamic_res_tokens: int) -> torch.Tensor:
     """
-    Builds correct padding mask for inference, accounting for self-token and dynamic resonant tokens.
+    Builds padding mask correctly for input_seq, accounting for dynamic resonant tokens.
+    No self-token prepended manually here.
     """
-    # Start with base mask (where input tokens == pad)
+    # Start with base mask (input tokens)
     padding_mask = (input_seq == pad_id)
 
-    # Prepend one False for self-token
-    padding_mask = torch.cat(
-        [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
-         padding_mask],
-        dim=1
-    )
-
-    # Prepend dynamic resonant token slots (also False)
+    # Prepend extra False for dynamic resonant tokens
     if dynamic_res_tokens > 0:
         extra = torch.zeros((padding_mask.size(0), dynamic_res_tokens), dtype=torch.bool, device=padding_mask.device)
         padding_mask = torch.cat([extra, padding_mask], dim=1)
 
     return padding_mask
+
 
 # List .pt files
 pt_files = [f for f in os.listdir('.') if f.endswith('.pt')]
