@@ -478,6 +478,11 @@ for epoch in range(num_epochs):
 
                 # recompute primary to get a fresh autograd graph
                 logits, res, flux_penalty = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
+            
+                # === Refresh resonant token grads after each inner step ===
+                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                    with torch.no_grad():
+                        model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
                 logits = logits[:, :inp.size(1), :]
                 primary_inner = crit(
                     logits.reshape(-1, logits.size(-1)),
