@@ -54,12 +54,12 @@ millions = int(max_tokens / 1_000_000)
 run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
 
 # Initialize wandb
-wandb.init(project="resonant-transformer-RoPE2", name=run_name, config={
+wandb.init(project="resonant-transformer-LR-aligned", name=run_name, config={
     **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
         'd_model','num_heads','num_layers','resonant_token_count',
         'dynamic_resonant_token_count','learning_rate','batch_size',
         'num_epochs','sequence_length','max_tokens','multihead_resonance',
-        'recursive_convergence_tolerance'
+        'recursive_convergence_tolerance', 'flux_penalty_weight'
     ]}
 })
 
@@ -272,6 +272,8 @@ for epoch in range(num_epochs):
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
             if not baseline:
                 logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
+                # === Fix flux_penalty to safe float32 outside autocast ===
+                flux_penalty = flux_penalty.to(torch.float32)
             else:
                 logits, res, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
             steps = getattr(model, "last_recursive_steps", 0)
@@ -563,7 +565,9 @@ for epoch in range(num_epochs):
                 'self_attn_mean':self_attn_mean,
                 'recursive_steps':steps,
                 'last_flux_cost': model.last_flux_cost if hasattr(model, "last_flux_cost") else 0.0,
-                'flux_budget': model.flux_budget if hasattr(model, "flux_budget") else 0.0
+                'flux_budget': model.flux_budget if hasattr(model, "flux_budget") else 0.0,
+                'diversity_penalty': dvt.item(),
+                'contrastive_loss': con.item()
             }, step=global_step)
             print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | STEPS: {steps}")
 
@@ -588,7 +592,9 @@ for epoch in range(num_epochs):
                 'dynamic_resonant_token_count': dynamic_resonant_token_count,
                 'multihead': multihead_resonance,
                 'recursive_convergence_tolerance': recursive_convergence_tolerance,
-                'max_recursive_steps': max_recursive_steps
+                'max_recursive_steps': max_recursive_steps,
+                'recursive_convergence_tolerance': recursive_convergence_tolerance,
+                'flux_penalty_weight': flux_penalty_weight
             },
             'final_resonant_state': getattr(model, '_res_tokens_for_ri', None)
         }
@@ -615,7 +621,9 @@ state = {
         'dynamic_resonant_token_count': dynamic_resonant_token_count,
         'multihead': multihead_resonance,
         'recursive_convergence_tolerance': recursive_convergence_tolerance,
-        'max_recursive_steps': max_recursive_steps
+        'max_recursive_steps': max_recursive_steps,
+        'recursive_convergence_tolerance': recursive_convergence_tolerance,
+        'flux_penalty_weight': flux_penalty_weight
     },
     'final_resonant_state': last_res
 }
