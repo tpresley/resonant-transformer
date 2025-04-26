@@ -82,10 +82,10 @@ while True:
     # === Encode with <bos> and <eos> ===
     encoded = tokenizer.encode(user_input)
     tokens = [bos_id] + encoded.ids
-    tokens = tokens[:sequence_length]
+    tokens = tokens[:sequence_length - 1]
     input_length = len(tokens)
-    if input_length < sequence_length:
-        tokens += [pad_id] * (sequence_length - len(tokens))
+    if input_length < (sequence_length - 1):
+        tokens += [pad_id] * ((sequence_length - 1) - len(tokens))
 
     generated = tokens[:]
     with torch.no_grad():
