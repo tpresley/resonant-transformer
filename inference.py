@@ -162,7 +162,7 @@ while True:
             context = prepare_context(model, input_seq)
 
             if not baseline:
-                logits, _ = model.recursive_forward(
+                logits, _, _ = model.recursive_forward(
                     input_seq,
                     context=context,
                     tol=recursive_convergence_tolerance,
