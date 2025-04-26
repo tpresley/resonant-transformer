@@ -91,7 +91,17 @@ while True:
     with torch.no_grad():
         for current in range(100):
             input_seq = torch.tensor(generated[-sequence_length:], dtype=torch.long).unsqueeze(0).to(DEVICE)
+            # build padding mask for input
             padding_mask = (input_seq == pad_id)
+
+            # === CORRECT padding mask adjustment ===
+            # we need to account for +1 self-token
+            # self-token is not padding, so prepend False to mask
+            padding_mask = torch.cat(
+                [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
+                padding_mask],
+                dim=1
+            )
 
             # === Match training context derivation ===
             if model.global_res is not None:
