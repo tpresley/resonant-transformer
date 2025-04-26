@@ -377,7 +377,7 @@ for epoch in range(num_epochs):
             akl = F.kl_div(cur.log(), avg, reduction='batchmean')
             akl = torch.clamp(akl, max=0.1)             # cap at 0.1 nats
             primary = primary - lambda_attn * akl   # modestly upweight if desired
-            attn_records.clear()
+            del attn_records[:]
         else:
             akl = torch.tensor(0.0, device=DEVICE)
 
@@ -501,6 +501,7 @@ for epoch in range(num_epochs):
         torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
 
         opt.step()
+        del attn_records[:]
 
         # Clamp resonant token norms post-update to prevent explosion
         with torch.no_grad():
