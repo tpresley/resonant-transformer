@@ -466,22 +466,32 @@ for epoch in range(num_epochs):
         opt.zero_grad()
         final.backward()
 
-        if not baseline:
-            # NOW extract the _actual_ gradients on the resonant tokens
-            # — raw‐dot RI & standard RS (no grad‑norm division) —
-            if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.grad is not None:
+        val_ri = 0.0
+        val_rs = 0.0
+        val_cos_sim = 0.0
+        res_token_norm = 0.0
+        stat_norm = 0.0
+        dyn_norm = 0.0
+        mh_norm = 0.0
+        dvt = torch.tensor(0.0, device=DEVICE)
+
+        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
+            if model._res_tokens_for_ri.grad is not None:
                 gr = model._res_tokens_for_ri.grad  # (B, T, D)
-                # raw absolute dot ⇝ “influence” magnitude
                 ri_v = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()
                 rs_v = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
+                cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
                 val_ri = ri_v.mean().item()
                 val_rs = rs_v.mean().item()
-                cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
                 val_cos_sim = cos_sim_v.mean().item()
-            else:
-                val_ri = 0.0
-                val_rs = 0.0
-                val_cos_sim = 0.0
+            res_token_norm = model._res_tokens_for_ri.norm().item()
+            if hasattr(model, 'resonant_tokens'):
+                stat_norm = model.resonant_tokens.norm().item()
+            if hasattr(model, 'controller'):
+                dyn_norm = model.controller(context_vec).norm().item()
+            if hasattr(model, 'resonator'):
+                mh_norm = model.resonator(context_vec).norm().item()
+            dvt = diversity_penalty(model._res_tokens_for_ri)
 
             
             cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
@@ -607,15 +617,9 @@ for epoch in range(num_epochs):
                 dyn_norm = model.controller(context_vec).norm().item() if hasattr(model, 'controller') else 0
                 mh_norm = model.resonator(context_vec).norm().item() if hasattr(model, 'resonator') else 0
 
-            if baseline:
-                val_sr = 0.0
-                val_akl = 0.0
-                val_rr = 0.0
-                val_cos_sim = 0
-            else:
-                val_sr = sur_reward.item()
-                val_akl = akl.item()
-                val_rr = res_reward.item()
+            val_sr = sur_reward.item() if not baseline else 0.0
+            val_akl = akl.item() if not baseline else 0.0
+            val_rr = res_reward.item() if not baseline else 0.0
             
             now = time.time()
             delta_s = now - last_run_time
