@@ -33,6 +33,27 @@ def prepare_context(model: nn.Module, input_seq: torch.Tensor) -> torch.Tensor:
 
     return context
 
+def prepare_padding_mask(input_seq: torch.Tensor, pad_id: int, dynamic_res_tokens: int) -> torch.Tensor:
+    """
+    Builds correct padding mask for inference, accounting for self-token and dynamic resonant tokens.
+    """
+    # Start with base mask (where input tokens == pad)
+    padding_mask = (input_seq == pad_id)
+
+    # Prepend one False for self-token
+    padding_mask = torch.cat(
+        [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
+         padding_mask],
+        dim=1
+    )
+
+    # Prepend dynamic resonant token slots (also False)
+    if dynamic_res_tokens > 0:
+        extra = torch.zeros((padding_mask.size(0), dynamic_res_tokens), dtype=torch.bool, device=padding_mask.device)
+        padding_mask = torch.cat([extra, padding_mask], dim=1)
+
+    return padding_mask
+
 # List .pt files
 pt_files = [f for f in os.listdir('.') if f.endswith('.pt')]
 if not pt_files:
@@ -123,22 +144,9 @@ while True:
         for current in range(100):
             input_seq = torch.tensor(generated[-(sequence_length-1):], dtype=torch.long).unsqueeze(0).to(DEVICE)
 
-            # === Build correct padding mask with self-token accounted ===
-            padding_mask = (input_seq == pad_id)
-            padding_mask = torch.cat(
-                [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
-                 padding_mask],
-                dim=1
-            )
-
-            # === CORRECT padding mask adjustment ===
-            # we need to account for +1 self-token
-            # self-token is not padding, so prepend False to mask
-            padding_mask = torch.cat(
-                [torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=padding_mask.device),
-                padding_mask],
-                dim=1
-            )
+            # === Correct padding mask building ===
+            dynamic_res_tokens = getattr(model, "dynamic_resonant_token_count", 0)
+            padding_mask = prepare_padding_mask(input_seq, pad_id, dynamic_res_tokens)
 
             # === Use new helper for safe context prep ===
             context = prepare_context(model, input_seq)
