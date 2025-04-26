@@ -600,6 +600,8 @@ for epoch in range(num_epochs):
                     context_vec = model.global_res.mean(dim=1).expand(batch_size, -1).contiguous()
                 else:
                     context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
+            else:
+                context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
 
 
             if (resonant_token_count + dynamic_resonant_token_count) == 0:
