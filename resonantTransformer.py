@@ -328,6 +328,7 @@ class EnhancedResonantTransformer(nn.Module):
         attn_maps = None
 
         self.last_recursive_steps = 1
+        self.excess_flux_count = 0
 
         total_flux_penalty = torch.tensor(0.0, device=x.device)  # Accumulate excess flux
 
@@ -406,7 +407,7 @@ class EnhancedResonantTransformer(nn.Module):
             excess_flux = flux_cost - self.flux_budget
             excess_flux_penalty = torch.relu(excess_flux)
             if excess_flux_penalty.item() > 0:
-                print(f"[FLUX PENALTY] Step {step} — {excess_flux.item():.4f} over budget ({self.flux_budget:.4f})")
+                self.excess_flux_count += 1
             total_flux_penalty += excess_flux_penalty
 
             # === Hidden state for self-modeling ===
@@ -536,13 +537,18 @@ def inject_resonant_noise(tokens, noise_level=0.1):
     noise = F.normalize(noise, dim=-1)
     return tokens + noise_level * noise
 
-def diversity_penalty(tokens):
-    normed = F.normalize(tokens, dim=-1)
-    sim_matrix = torch.einsum('btd,bkd->btk', normed, normed)
-    eye = torch.eye(sim_matrix.size(-1), device=sim_matrix.device).unsqueeze(0)
-    sim_matrix = sim_matrix * (1 - eye)
-    penalty = sim_matrix.sum(dim=(1, 2)) / (tokens.size(1) * (tokens.size(1) - 1))
-    return penalty.mean()
+def diversity_penalty(x):
+    """
+    x: tensor of shape [batch, tokens, dim]
+    returns a scalar penalty encouraging diversity between tokens
+    """
+    normed = F.normalize(x, dim=-1, eps=1e-6)  # <<== small epsilon prevents division by zero
+    sim_matrix = torch.einsum('btd,bkd->btk', normed, normed)  # batch matrix multiplication
+    batch_size, num_tokens, _ = sim_matrix.shape
+    mask = torch.eye(num_tokens, device=sim_matrix.device).bool().unsqueeze(0)
+    sim_matrix.masked_fill_(mask, 0.0)
+    penalty = sim_matrix.abs().mean()
+    return penalty
 
 def cosine_rampup(t, warmup_epochs):
     if t >= warmup_epochs:

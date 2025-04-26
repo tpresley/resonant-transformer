@@ -424,6 +424,13 @@ for epoch in range(num_epochs):
         
         final = (primary - penalty + term3 + term4) + con
 
+        # === ADDITION: small constant diversity encouragement every batch ===
+        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            batch_div_loss = 0.001 * diversity_penalty(model._res_tokens_for_ri)
+            final = final + batch_div_loss
+        else:
+            batch_div_loss = torch.tensor(0.0, device=DEVICE)
+
         # Backprop the full loss
         opt.zero_grad()
         final.backward()
@@ -582,6 +589,8 @@ for epoch in range(num_epochs):
             delta_s = now - last_run_time
             last_run_time = now
 
+            excess_flux_count = model.excess_flux_count  if hasattr(model, "excess_flux_count") else 0
+
             wandb.log({
                 'loss':final.item(),
                 'perplexity':float(np.exp(final.item())),
@@ -600,9 +609,10 @@ for epoch in range(num_epochs):
                 'last_flux_cost': model.last_flux_cost if hasattr(model, "last_flux_cost") else 0.0,
                 'flux_budget': model.flux_budget if hasattr(model, "flux_budget") else 0.0,
                 'diversity_penalty': dvt.item(),
-                'contrastive_loss': con.item()
+                'contrastive_loss': con.item(),
+                'excess_flux_count': excess_flux_count
             }, step=global_step)
-            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | STEPS: {steps}")
+            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | STEPS: {steps} | EFC: {excess_flux_count}")
 
     # === Save checkpoint at end of this epoch ===
     if (epoch + 1) % 10 == 0:
