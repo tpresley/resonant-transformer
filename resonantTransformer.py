@@ -152,6 +152,7 @@ class EnhancedResonantTransformer(nn.Module):
         self._res_tokens_for_ri = None
 
         self.flux_budget = None         # No initial limit
+        self.excess_flux_count = 0
         self.budget_ema = None          # Moving baseline
         self.budget_alpha = 2.5         # Multiplier over recent average cost
         self.budget_beta = 0.05         # EMA smoothing factor
