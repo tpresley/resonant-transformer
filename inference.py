@@ -53,8 +53,17 @@ model = EnhancedResonantTransformer(
 )
 # Resize saved context to match inference-time batch size
 if resonant_context is not None:
-    if resonant_context.size(0) != 1:
-        resonant_context = resonant_context[0:1]  # Just use first row for single-sample inference
+    if resonant_context.dim() == 3:
+        # resonant_context shape is [batch, num_tokens, d_model]
+        resonant_context = resonant_context[0:1]  # Select first batch if needed
+        model.global_res = resonant_context.to(DEVICE)
+    elif resonant_context.dim() == 2:
+        # Already [batch, d_model], fine
+        model.global_res = resonant_context.unsqueeze(1).to(DEVICE)
+    else:
+        raise ValueError(f"[load] Unexpected resonant_context shape: {resonant_context.shape}")
+else:
+    model.global_res = None
 
 model.load_state_dict(state["model_state_dict"])
 model.to(DEVICE)
