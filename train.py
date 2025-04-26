@@ -475,21 +475,16 @@ for epoch in range(num_epochs):
 
             # 2) inner token‑only loop
             for _ in range(5):
-
-                # recompute primary to get a fresh autograd graph
+                # Forward pass
                 logits, res, flux_penalty = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
-            
-                # === Refresh resonant token grads after each inner step ===
-                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                    with torch.no_grad():
-                        model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
                 logits = logits[:, :inp.size(1), :]
+                
                 primary_inner = crit(
                     logits.reshape(-1, logits.size(-1)),
                     tgt.reshape(-1)
                 )
 
-                # compute the gradient of that primary w.r.t. the tokens
+                # compute the gradient of that primary w.r.t. the resonant tokens
                 grad_tuple = torch.autograd.grad(
                     primary_inner,
                     model._res_tokens_for_ri,
@@ -501,22 +496,34 @@ for epoch in range(num_epochs):
                 if gr_inner is None:
                     gr_inner = torch.zeros_like(model._res_tokens_for_ri)
 
-                # now build the same RI/RS/div terms
+                # Build RI/RS/Diversity terms
                 ri_v_inner = (gr_inner * model._res_tokens_for_ri).sum(dim=-1).abs()
-                term1      = lambda_ri * ri_v_inner.mean()
+                term1 = lambda_ri * ri_v_inner.mean()
                 rs_v_inner = 1 - F.cosine_similarity(gr_inner, model._res_tokens_for_ri, dim=-1)
-                term2      = lambda_rs * rs_v_inner.mean()
-                dvt        = lambda_div * diversity_penalty(model._res_tokens_for_ri)
+                term2 = lambda_rs * rs_v_inner.mean()
+                dvt = lambda_div * diversity_penalty(model._res_tokens_for_ri)
 
                 token_loss = term1 + term2 + dvt
+
+                # Backward the token loss
                 opt.zero_grad()
-                scaler.scale(final).backward()
-                scaler.step(opt) 
-                scaler.update()
+                token_loss.backward()
+                opt.step()
+
+                # === Refresh resonant token grads AFTER backward and step ===
+                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                    with torch.no_grad():
+                        model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
+
+            # === After all mini-steps, refresh _res_tokens_for_ri AGAIN ===
+            if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                with torch.no_grad():
+                    model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
 
             # 3) unfreeze everything
             for p in model.parameters():
                 p.requires_grad_(True)
+
 
         # update
         last_res = getattr(model,'_res_tokens_for_ri',None)
