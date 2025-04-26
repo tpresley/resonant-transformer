@@ -96,8 +96,7 @@ if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
     tokenizer.save_model(tokenizer_dir)
 else:
     print("[Tokenizer] Loading existing tokenizer...")
-    tokenizer = ByteLevelBPETokenizer()
-    tokenizer.from_file(vocab_path, merges_path)
+    tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path)
 
 tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
 pad_id = tokenizer.token_to_id("<pad>")
@@ -625,7 +624,6 @@ for epoch in range(num_epochs):
                 'resonant_token_count': resonant_token_count,
                 'dynamic_resonant_token_count': dynamic_resonant_token_count,
                 'multihead': multihead_resonance,
-                'recursive_convergence_tolerance': recursive_convergence_tolerance,
                 'max_recursive_steps': max_recursive_steps,
                 'recursive_convergence_tolerance': recursive_convergence_tolerance,
                 'flux_penalty_weight': flux_penalty_weight
@@ -654,7 +652,6 @@ state = {
         'resonant_token_count': resonant_token_count,
         'dynamic_resonant_token_count': dynamic_resonant_token_count,
         'multihead': multihead_resonance,
-        'recursive_convergence_tolerance': recursive_convergence_tolerance,
         'max_recursive_steps': max_recursive_steps,
         'recursive_convergence_tolerance': recursive_convergence_tolerance,
         'flux_penalty_weight': flux_penalty_weight
