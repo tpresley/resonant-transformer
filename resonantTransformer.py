@@ -476,7 +476,7 @@ class EnhancedResonantTransformer(nn.Module):
             self.train()
             torch.set_grad_enabled(True)
 
-        return logits, hidden, total_flux_penalty
+        return logits, hidden, total_flux_penalty.detach()
 
 
 
