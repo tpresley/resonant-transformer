@@ -28,7 +28,7 @@ resonant_token_count = 6
 dynamic_resonant_token_count = 4
 # How many epochs in the beginning to prevent Resonant Tokens
 # from influencing model weights (helps prevent collapse from early misalignment)
-warmup_epochs = 1
+warmup_epochs = 5
 # Multiple over the standard model learning to amplify learning in reonant tokens
 token_learning_amplifier = 5
 # Scalar controlling how strongly resonant tokens are optimized to align with
