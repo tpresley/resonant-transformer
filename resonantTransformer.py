@@ -23,6 +23,8 @@ def apply_rope(q, k, seq_dim=1):
     return rotate(q), rotate(k)
 
 def repair_if_invalid(x, name="tensor", counter=None):
+    if x is None:
+        return x  # Nothing to repair if tensor is None
     if torch.isnan(x).any() or torch.isinf(x).any():
         print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
         x.data = torch.nan_to_num(x.data, nan=0.0, posinf=1e4, neginf=-1e4)
