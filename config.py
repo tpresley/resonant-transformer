@@ -12,9 +12,9 @@ num_layers = 6
 vocab_size = 1024
 sequence_length = 128
 max_tokens = 5_000_000
-learning_rate = 2e-4
+learning_rate = 1e-4
 weight_decay = 0.01
-batch_size = 512
+batch_size = 256
 num_epochs = 50
 
 
@@ -23,9 +23,9 @@ num_epochs = 50
 #####
 
 # Number of Static Resonant Tokens (zero to disable)
-resonant_token_count = 4
+resonant_token_count = 6
 # Number of Dynamic Resonant Tokens to use (zero to disable)
-dynamic_resonant_token_count = 2
+dynamic_resonant_token_count = 4
 # How many epochs in the beginning to prevent Resonant Tokens
 # from influencing model weights (helps prevent collapse from early misalignment)
 warmup_epochs = 1
