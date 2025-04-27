@@ -63,6 +63,7 @@ class ResonantController(nn.Module):
         out = self.linear(context_embedding).view(-1, self.res_tokens, self.d_model)
         out = F.layer_norm(out, (self.d_model,))
         out = F.normalize(out, dim=-1) * 0.5  # target norm = 1.0 per token
+        out = torch.clamp(out, min=-1.0, max=1.0)  # Clamp dynamic resonant tokens
         return out
 
 
@@ -342,10 +343,18 @@ class EnhancedResonantTransformer(nn.Module):
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
+            logits = repair_if_invalid(logits, name="logits")
+            res = repair_if_invalid(res, name="resonant output")
+            hidden = repair_if_invalid(hidden, name="hidden state")
+            context = repair_if_invalid(context, name="context vector")
+
             # === Soft fade-in for newly added recursion steps ===
             if fade_in_steps is not None and step >= fade_in_steps:
                 hidden = (1.0 - fade_in_strength) * previous_hidden + fade_in_strength * hidden
 
+            # Normalize hidden immediately after blending
+            hidden = F.layer_norm(hidden, (hidden.size(-1),))
+            
             previous_hidden = hidden.detach()  # update stored hidden
 
             # Normalize hidden state to control norm drift
@@ -449,6 +458,9 @@ class EnhancedResonantTransformer(nn.Module):
 
             context_vec_ema = ema_decay * old_context_vec + (1 - ema_decay) * new_context_vec
             context = context_vec_ema.detach()  # Update for next step
+
+            # Normalize context after EMA update
+            context = F.layer_norm(context, (context.size(-1),))
 
             # Assert
             assert context.shape[-1] == self.d_model, f"Context shape mismatch: expected {self.d_model}, got {context.shape}"
@@ -585,3 +597,13 @@ def compute_modulation_signal(recursive_flux, threshold=0.5):
     # Sigmoid-shaped scaling function
     return torch.tanh((recursive_flux - threshold) * 5.0).clamp(0.0, 1.0)
 
+from train import global_repair_counter  # Import global tracker
+
+def repair_if_invalid(x, name="tensor"):
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
+        x.data = torch.nan_to_num(x.data, nan=0.0, posinf=1e4, neginf=-1e4)
+        x.data = torch.clamp(x.data, min=-1e4, max=1e4)
+        if name in global_repair_counter:
+            global_repair_counter[name] += 1
+    return x

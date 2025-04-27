@@ -46,6 +46,14 @@ def hard_project_onto_hypersphere(x, radius=1.0, eps=1e-8):
     norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
     return x / norm * radius
 
+# === Repair tracker ===
+global_repair_counter = {
+    "logits": 0,
+    "resonant output": 0,
+    "hidden state": 0,
+    "context vector": 0
+}
+
 # === Hyperparameters & Config ===
 from config import (
     baseline,
@@ -754,6 +762,7 @@ for epoch in range(num_epochs):
 
             excess_flux_count = model.excess_flux_count  if hasattr(model, "excess_flux_count") else 0
             loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
+            vector_repairs = global_repair_counter["logits"] + global_repair_counter["resonant output"] + global_repair_counter["hidden state"] + global_repair_counter["context vector"]
 
             wandb.log({
                 'loss':final.item(),
@@ -778,8 +787,12 @@ for epoch in range(num_epochs):
                 'entropy_loss_skips': skip_counts["entropy_loss"],
                 'surprisal_loss_skips': skip_counts["surprisal_loss"],
                 'resolution_loss_skips': skip_counts["resolution_loss"],
+                'repairs_logits': global_repair_counter["logits"],
+                'repairs_resonant_output': global_repair_counter["resonant output"],
+                'repairs_hidden_state': global_repair_counter["hidden state"],
+                'repairs_context_vector': global_repair_counter["context vector"]
             }, step=global_step)
-            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count}")
+            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | REPAIRS: {vector_repairs}")
 
     # === Save checkpoint at end of this epoch ===
     if (epoch + 1) % 10 == 0:
