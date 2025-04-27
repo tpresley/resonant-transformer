@@ -260,6 +260,8 @@ skip_counts = {
     "resolution_loss": 0
 }
 
+final_max_steps = model.max_recursive_steps
+model.max_recursive_steps = 1
 
 # Training
 for epoch in range(num_epochs):
@@ -315,6 +317,10 @@ for epoch in range(num_epochs):
     if epoch < warmup_epochs:
         for p in inner_res_params:
             p.requires_grad_(False)
+
+    # ramp max_recursive_steps over time
+    if hasattr(model, "max_recursive_steps") and epoch > warmup_epochs and model.max_recursive_steps < final_max_steps:
+        model.max_recursive_steps += 1
 
 
     # Rebuild fresh references to resonant-token parameters
