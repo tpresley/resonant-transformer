@@ -238,9 +238,14 @@ class EnhancedResonantTransformer(nn.Module):
         if self.static_resonant_token_count > 0:
             static = self.resonant_tokens.expand(B, -1, -1).clone()
             res_list.append(static)
+
         if self.dynamic_resonant_token_count > 0:
             dyn = self.controller(context_vec)
+            self.dynamic_tokens_latest = dyn.detach()
             res_list.append(dyn)
+        else:
+            self.dynamic_tokens_latest = None
+
         if self.multihead:
             mh = self.resonator(context_vec)
             res_list.append(mh)
@@ -481,6 +486,11 @@ class EnhancedResonantTransformer(nn.Module):
                 old_context_vec = new_context_vec
 
             context_vec_ema = ema_decay * old_context_vec + (1 - ema_decay) * new_context_vec
+            context_vec_ema = F.layer_norm(context_vec_ema, (context_vec_ema.size(-1),))
+
+            # === Track context flux for bonus ===
+            flux_movement = (new_context_vec - old_context_vec).pow(2).mean()
+            self.latest_context_flux = flux_movement
             context = context_vec_ema.detach()  # Update for next step
 
             # Normalize context after EMA update

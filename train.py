@@ -268,6 +268,7 @@ skip_counts = {
     "resolution_loss": 0
 }
 
+resonant_attention_scale = 1.0
 final_max_steps = model.max_recursive_steps
 # start at 2 resursive steps and ramp to the configured number
 model.max_recursive_steps = 2
@@ -311,7 +312,8 @@ for epoch in range(num_epochs):
         opt = torch.optim.Adam(param_groups)
 
         # === Boost resonant token attention incentive ===
-        lambda_resonant_attention *= 2.0
+        # lambda_resonant_attention *= 2.0
+        resonant_attention_scale = 2.0
 
         # === Force a refresh of _res_tokens_for_ri ===
         if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
@@ -515,7 +517,8 @@ for epoch in range(num_epochs):
             if num_resonant_tokens > 0 and avg_attn_map.size(-1) >= num_resonant_tokens:
                 # Only consider attention towards resonant token positions
                 attn_bonus = avg_attn_map[:, :, :num_resonant_tokens].sum(dim=-1).mean()
-                primary = primary - lambda_resonant_attention * attn_bonus
+                resonant_attention_reward = (attn_bonus ** 2).mean()  # stronger quadratic scaling
+                primary = primary - (lambda_resonant_attention * resonant_attention_scale) * resonant_attention_reward
             else:
                 attn_bonus = torch.tensor(0.0, device=DEVICE)
         else:
@@ -568,6 +571,15 @@ for epoch in range(num_epochs):
         # adjust loss for flux (cognitive fatigue)
         if not baseline:
             term4 = flux_penalty_weight * flux_penalty
+
+        if hasattr(model, "dynamic_tokens_latest") and model.dynamic_tokens_latest is not None and model.dynamic_tokens_latest.numel() > 0:
+            dynamic_variance = model.dynamic_tokens_latest.var(dim=-1).mean()
+            resonant_usage_penalty = F.relu(0.05 - dynamic_variance)  # encourage at least variance ~0.05
+            primary = primary + 0.1 * resonant_usage_penalty
+
+        if hasattr(model, "latest_context_flux") and model.latest_context_flux is not None:
+            context_flux_bonus = model.latest_context_flux
+            primary = primary - 0.05 * context_flux_bonus
 
         if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
             model._res_tokens_for_ri.grad = None
