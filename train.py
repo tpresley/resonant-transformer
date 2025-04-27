@@ -249,6 +249,13 @@ res_baseline = None
 
 last_run_time = time.time()
 
+# Track entropy skip counts per epoch
+skip_counts = {
+    "entropy_loss": 0,
+    "surprisal_loss": 0,
+    "resolution_loss": 0
+}
+
 
 # Training
 for epoch in range(num_epochs):
@@ -387,8 +394,14 @@ for epoch in range(num_epochs):
         if not baseline:
             lp  = F.log_softmax(logits, dim=-1)
             tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-            spr = -tlp; dr = spr[:,:-1]-spr[:,1:]
-            sur = F.relu(dr).mean() / inp.size(1)        # normalize per token
+            spr = -tlp
+            dr = spr[:, :-1] - spr[:, 1:]
+            sur = F.relu(dr).mean() / inp.size(1)
+            # Guard against NaNs/Infs during surprisal computation
+            if torch.isnan(sur) or torch.isinf(sur):
+                print("[entropy_surprisal] Warning: skipping surprisal loss due to invalid values.")
+                sur = torch.tensor(0.0, device=DEVICE)
+                skip_counts["surprisal_loss"] += 1
             sur = torch.clamp(sur, max=0.5)             # clip to [0, 0.5]
 
             # update running baseline
@@ -418,8 +431,15 @@ for epoch in range(num_epochs):
 
         # — Resolution‑coherence reward (clipped, baselined) —
         if not baseline and logits.size(1) >= 2:
-            pr  = lp.exp()
-            ent = -(pr * lp).sum(-1)
+            pr = lp.exp()
+            pr = pr.clamp(min=1e-5, max=1.0-1e-5)  # New
+            lp = torch.log(pr)                      # New
+            if torch.isnan(pr).any() or torch.isinf(pr).any() or torch.isnan(lp).any() or torch.isinf(lp).any():
+                print("[entropy_resolution] Warning: skipping resolution loss due to invalid values.")
+                ent = torch.zeros_like(lp.sum(-1))
+                skip_counts["resolution_loss"] += 1
+            else:
+                ent = -(pr * lp).sum(-1)
             pen, pos = ent[:, -2], ent[:, -1]
             rr = F.relu(pen - pos).mean()
             rr = torch.clamp(rr, max=0.5)
@@ -460,6 +480,7 @@ for epoch in range(num_epochs):
             if torch.isnan(pr_ent).any() or torch.isinf(pr_ent).any() or torch.isnan(lp_ent).any() or torch.isinf(lp_ent).any():
                 print("[entropy_loss] Warning: skipping entropy loss due to invalid values.")
                 ent_loss = torch.tensor(0.0, device=pr_ent.device)
+                skip_counts["entropy_loss"] += 1
             else:
                 ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
             # small weight to reward higher entropy
@@ -697,6 +718,7 @@ for epoch in range(num_epochs):
             last_run_time = now
 
             excess_flux_count = model.excess_flux_count  if hasattr(model, "excess_flux_count") else 0
+            loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
 
             wandb.log({
                 'loss':final.item(),
@@ -717,9 +739,12 @@ for epoch in range(num_epochs):
                 'flux_budget': model.flux_budget if hasattr(model, "flux_budget") else 0.0,
                 'diversity_penalty': dvt.item(),
                 'contrastive_loss': con.item(),
-                'excess_flux_count': excess_flux_count
+                'excess_flux_count': excess_flux_count,
+                'entropy_loss_skips': skip_counts["entropy_loss"],
+                'surprisal_loss_skips': skip_counts["surprisal_loss"],
+                'resolution_loss_skips': skip_counts["resolution_loss"],
             }, step=global_step)
-            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | STEPS: {steps} | EFC: {excess_flux_count}")
+            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count}")
 
     # === Save checkpoint at end of this epoch ===
     if (epoch + 1) % 10 == 0:
