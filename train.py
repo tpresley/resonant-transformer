@@ -180,7 +180,7 @@ model = EnhancedResonantTransformer(
 ).to(DEVICE)
 model.train()
 
-dynamic_attn_cap = max(10, int(0.5 * model.num_layers * model.num_heads))
+dynamic_attn_cap = max(10, int(0.5 * num_layers * num_heads))
 
 torch.autograd.set_detect_anomaly(True)
 
