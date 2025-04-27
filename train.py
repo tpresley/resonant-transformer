@@ -72,7 +72,7 @@ millions = int(max_tokens / 1_000_000)
 run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
 
 # Initialize wandb
-wandb.init(project="resonant-transformer-LR-aligned", name=run_name, config={
+wandb.init(project="resonant-transformer-annealing", name=run_name, config={
     **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
         'd_model','num_heads','num_layers','resonant_token_count',
         'dynamic_resonant_token_count','learning_rate','batch_size',
@@ -234,6 +234,12 @@ else:
         'weight_decay': weight_decay}
     ])
     
+# Set up cosign annealing for the learning rate to help prevent overfitting
+from torch.optim.lr_scheduler import CosineAnnealingLR
+dataset_size = len(all_sequences)
+steps_per_epoch = dataset_size // batch_size
+total_training_steps = steps_per_epoch * num_epochs
+cosine_scheduler = CosineAnnealingLR(opt, T_max=total_training_steps, eta_min=1e-5)
 
 crit = nn.CrossEntropyLoss(ignore_index=pad_id)
 last_res=None
@@ -539,6 +545,8 @@ for epoch in range(num_epochs):
         torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
 
         opt.step()
+        if epoch >= warmup_epochs:  # Only run cosine after warmup
+            cosine_scheduler.step()
         del attn_records[:]
 
         # Clamp resonant token norms post-update to prevent explosion
