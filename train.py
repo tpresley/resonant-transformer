@@ -446,7 +446,16 @@ for epoch in range(num_epochs):
             lp_ent = F.log_softmax(logits, dim=-1)      # shape [B, L, V]
             pr_ent = lp_ent.exp()                       # shape [B, L, V]
             # entropy per token = −∑ p log p; then mean over batch & sequence
-            ent_loss = -((pr_ent + 1e-8) * (lp_ent + 1e-8)).sum(-1).mean()
+            # Safer entropy loss computation
+            # Clamp pr_ent to avoid degenerate zeros/ones
+            pr_ent = pr_ent.clamp(min=1e-5, max=1.0-1e-5)
+            lp_ent = torch.log(pr_ent)
+            # Check for any NaNs or Infs after clamping (ultra safe)
+            if torch.isnan(pr_ent).any() or torch.isinf(pr_ent).any() or torch.isnan(lp_ent).any() or torch.isinf(lp_ent).any():
+                print("[entropy_loss] Warning: skipping entropy loss due to invalid values.")
+                ent_loss = torch.tensor(0.0, device=pr_ent.device)
+            else:
+                ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
             # small weight to reward higher entropy
             primary = primary - 1e-4 * ent_loss
 
