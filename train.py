@@ -359,6 +359,12 @@ for epoch in range(num_epochs):
                             print("[repair] NaNs detected in recursive output (res). Clamping...")
                             res.data[mask] = 0.0
 
+                # Conditionally clamp res only if needed
+                if res.abs().max() > 10.0:
+                    print("[stabilize] Large values detected in res. Clamping to [-10, 10].")
+                    res = torch.clamp(res, min=-10.0, max=10.0)
+
+
                 # === Fix flux_penalty to safe float32 outside autocast ===
                 flux_penalty = flux_penalty.to(torch.float32)
             else:
@@ -560,6 +566,11 @@ for epoch in range(num_epochs):
                         if mask.any():
                             print("[repair] NaNs detected in recursive output (res). Clamping...")
                             res.data[mask] = 0.0
+
+                # Conditionally clamp res only if needed
+                if res.abs().max() > 10.0:
+                    print("[stabilize] Large values detected in res. Clamping to [-10, 10].")
+                    res = torch.clamp(res, min=-10.0, max=10.0)
 
                 logits = logits[:, :inp.size(1), :]
                 
