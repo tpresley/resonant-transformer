@@ -261,7 +261,8 @@ skip_counts = {
 }
 
 final_max_steps = model.max_recursive_steps
-model.max_recursive_steps = 1
+# start at 2 resursive steps and ramp to the configured number
+model.max_recursive_steps = 2
 
 # Training
 for epoch in range(num_epochs):
@@ -362,7 +363,17 @@ for epoch in range(num_epochs):
 
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
             if not baseline:
-                logits, res, flux_penalty = model.recursive_forward(inp, ctx, tol=recursive_convergence_tolerance, padding_mask=padding_mask)
+
+                fade_in_steps = model.max_recursive_steps - 1  # The newly added step
+                fade_in_strength = min(1.0, bidx / len(loader))
+
+                logits, res, flux_penalty = model.recursive_forward(
+                    inp, ctx,
+                    tol=recursive_convergence_tolerance,
+                    padding_mask=padding_mask,
+                    fade_in_steps=fade_in_steps,
+                    fade_in_strength=fade_in_strength
+                )
 
                 # Immediately repair resonant tokens if needed
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:

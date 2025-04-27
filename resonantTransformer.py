@@ -289,7 +289,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
-    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None, inference_mode=False):
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None, inference_mode=False, fade_in_steps=None, fade_in_strength=1.0):
         """
         Full recursive inference with:
         - entropy / resolution / attention tracking
@@ -333,9 +333,16 @@ class EnhancedResonantTransformer(nn.Module):
 
         total_flux_penalty = torch.tensor(0.0, device=x.device)  # Accumulate excess flux
 
+        previous_hidden = None
+
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
+            # === Soft fade-in for newly added recursion steps ===
+            if fade_in_steps is not None and step >= fade_in_steps:
+                hidden = (1.0 - fade_in_strength) * previous_hidden + fade_in_strength * hidden
+
+            previous_hidden = hidden.detach()  # update stored hidden
 
             # === Entropy / surprisal tracking ===
             probs = torch.softmax(logits, dim=-1)
