@@ -359,6 +359,11 @@ class EnhancedResonantTransformer(nn.Module):
             hidden = repair_if_invalid(hidden, name="hidden state", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
             context = repair_if_invalid(context, name="context vector", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
 
+            # === Tiny noise injection to hidden states to maintain diversity ===
+            if self.training:
+                noise_strength = 1e-3  # adjustable: lower = safer
+                hidden = hidden + noise_strength * torch.randn_like(hidden)
+
             # === Soft fade-in for newly added recursion steps ===
             if fade_in_steps is not None and step >= fade_in_steps:
                 hidden = (1.0 - fade_in_strength) * previous_hidden + fade_in_strength * hidden

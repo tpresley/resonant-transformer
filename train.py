@@ -493,7 +493,15 @@ for epoch in range(num_epochs):
             # compute contrastive logits separately, no autograd tracking
             with torch.no_grad():
                 contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
-                con = contrastive_loss(logits, contrast_logits)
+                contrastive_loss_val = contrastive_loss(logits, contrast_logits)
+
+                # === Rescue if contrastive loss collapses ===
+                min_contrastive_loss = 1e-4
+                if contrastive_loss_val.item() < min_contrastive_loss:
+                    rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0  # adjustable
+                    contrastive_loss_val = contrastive_loss_val + rescue_boost
+                    print(f"[contrastive_loss_rescue] Boosted contrastive loss by {rescue_boost:.6f}")
+                con = contrastive_loss_val
         else:
             con = torch.tensor(0.0, device=DEVICE)
 
