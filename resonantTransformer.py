@@ -22,6 +22,17 @@ def apply_rope(q, k, seq_dim=1):
 
     return rotate(q), rotate(k)
 
+from train import global_repair_counter  # Import global tracker
+
+def repair_if_invalid(x, name="tensor"):
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
+        x.data = torch.nan_to_num(x.data, nan=0.0, posinf=1e4, neginf=-1e4)
+        x.data = torch.clamp(x.data, min=-1e4, max=1e4)
+        if name in global_repair_counter:
+            global_repair_counter[name] += 1
+    return x
+
 class MultiHeadResonance(nn.Module):
     def __init__(self, num_heads, res_tokens, d_model):
         super().__init__()
@@ -596,14 +607,3 @@ def compute_recursive_flux(entropy_deltas, attn_kls):
 def compute_modulation_signal(recursive_flux, threshold=0.5):
     # Sigmoid-shaped scaling function
     return torch.tanh((recursive_flux - threshold) * 5.0).clamp(0.0, 1.0)
-
-from train import global_repair_counter  # Import global tracker
-
-def repair_if_invalid(x, name="tensor"):
-    if torch.isnan(x).any() or torch.isinf(x).any():
-        print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
-        x.data = torch.nan_to_num(x.data, nan=0.0, posinf=1e4, neginf=-1e4)
-        x.data = torch.clamp(x.data, min=-1e4, max=1e4)
-        if name in global_repair_counter:
-            global_repair_counter[name] += 1
-    return x
