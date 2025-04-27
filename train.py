@@ -271,6 +271,7 @@ skip_counts = {
 final_max_steps = model.max_recursive_steps
 # start at 2 resursive steps and ramp to the configured number
 model.max_recursive_steps = 2
+model.repair_counter = global_repair_counter
 
 # Training
 for epoch in range(num_epochs):

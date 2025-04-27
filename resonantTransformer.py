@@ -24,13 +24,13 @@ def apply_rope(q, k, seq_dim=1):
 
 from train import global_repair_counter  # Import global tracker
 
-def repair_if_invalid(x, name="tensor"):
+def repair_if_invalid(x, name="tensor", counter=None):
     if torch.isnan(x).any() or torch.isinf(x).any():
         print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
         x.data = torch.nan_to_num(x.data, nan=0.0, posinf=1e4, neginf=-1e4)
         x.data = torch.clamp(x.data, min=-1e4, max=1e4)
-        if name in global_repair_counter:
-            global_repair_counter[name] += 1
+        if counter is not None and name in counter:
+            counter[name] += 1
     return x
 
 class MultiHeadResonance(nn.Module):
@@ -354,10 +354,10 @@ class EnhancedResonantTransformer(nn.Module):
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
-            logits = repair_if_invalid(logits, name="logits")
-            res = repair_if_invalid(res, name="resonant output")
-            hidden = repair_if_invalid(hidden, name="hidden state")
-            context = repair_if_invalid(context, name="context vector")
+            logits = repair_if_invalid(logits, name="logits", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            res = repair_if_invalid(res, name="resonant output", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            hidden = repair_if_invalid(hidden, name="hidden state", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            context = repair_if_invalid(context, name="context vector", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
 
             # === Soft fade-in for newly added recursion steps ===
             if fade_in_steps is not None and step >= fade_in_steps:
