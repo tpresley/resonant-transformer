@@ -22,8 +22,6 @@ def apply_rope(q, k, seq_dim=1):
 
     return rotate(q), rotate(k)
 
-from train import global_repair_counter  # Import global tracker
-
 def repair_if_invalid(x, name="tensor", counter=None):
     if torch.isnan(x).any() or torch.isinf(x).any():
         print(f"[repair_if_invalid] Warning: detected NaNs/Infs in {name}! Repairing...")
