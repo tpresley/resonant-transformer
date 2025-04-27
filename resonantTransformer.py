@@ -235,12 +235,10 @@ class EnhancedResonantTransformer(nn.Module):
 
         # If no resonant tokens are configured, create an empty placeholder
         if res_list:
-            # if self.training:
-            #     for i, t in enumerate(res_list):
-            #         print(f"Token source {i} norm: {t.norm().item():.4f}")
-            #     print(f"Token scale: {self.token_scale.item():.4f}")
-            safe_scale = self.token_scale.clamp(min=1.0, max=3.0)
-            tokens = torch.cat(res_list, dim=1) * safe_scale
+            safe_scale = self.token_scale.clamp(min=0.7, max=1.5)
+            tokens = torch.cat(res_list, dim=1)
+            tokens = F.normalize(tokens, dim=-1) * 0.5
+            tokens = tokens * safe_scale
 
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
@@ -266,6 +264,10 @@ class EnhancedResonantTransformer(nn.Module):
             blended_tokens = tokens  # preserve full gradient path in eval/inference
 
         inp = torch.cat([blended_tokens, emb], dim=1)
+
+        # Normalize after blending resonant tokens and input embedding
+        inp = F.layer_norm(inp, (self.d_model,))
+
         attn_maps = []
         out = inp
         for layer in self.encoder_layers:
@@ -276,6 +278,8 @@ class EnhancedResonantTransformer(nn.Module):
         seq_out = out[:, tokens.size(1):, :]
         hidden = seq_out
         logits = self.output(hidden)
+        # Clamp logits before using them to prevent exploding values
+        logits = torch.clamp(logits, min=-10.0, max=10.0)
         res = tokens
 
         # Update global_res using EMA only if flagged
@@ -343,6 +347,9 @@ class EnhancedResonantTransformer(nn.Module):
                 hidden = (1.0 - fade_in_strength) * previous_hidden + fade_in_strength * hidden
 
             previous_hidden = hidden.detach()  # update stored hidden
+
+            # Normalize hidden state to control norm drift
+            hidden = F.layer_norm(hidden, (hidden.size(-1),))
 
             # === Entropy / surprisal tracking ===
             probs = torch.softmax(logits, dim=-1)
