@@ -351,9 +351,7 @@ for epoch in range(num_epochs):
             with torch.no_grad():
                 model._res_tokens_for_ri.data = hard_project_onto_hypersphere(
                     model._res_tokens_for_ri.data,
-                    target_radius=0.5,   # consistent with your normal scaling
-                    tolerance=0.25,      # allow some breathing room
-                    strength=0.1         # gentle nudge
+                    radius=1.0
                 )
 
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
