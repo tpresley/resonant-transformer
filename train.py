@@ -343,7 +343,15 @@ for epoch in range(num_epochs):
                         mask = torch.isnan(model._res_tokens_for_ri)
                         if mask.any():
                             print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
-                            model._res_tokens_for_ri.data[mask] = 0.0  # or small random noise if you prefer
+                            model._res_tokens_for_ri.data[mask] = 0.0
+
+                # Immediately repair recursive output (res) if needed
+                if res is not None:
+                    with torch.no_grad():
+                        mask = torch.isnan(res)
+                        if mask.any():
+                            print("[repair] NaNs detected in recursive output (res). Clamping...")
+                            res.data[mask] = 0.0
 
                 # === Fix flux_penalty to safe float32 outside autocast ===
                 flux_penalty = flux_penalty.to(torch.float32)
@@ -537,7 +545,15 @@ for epoch in range(num_epochs):
                         mask = torch.isnan(model._res_tokens_for_ri)
                         if mask.any():
                             print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
-                            model._res_tokens_for_ri.data[mask] = 0.0  # or small random noise if you prefer
+                            model._res_tokens_for_ri.data[mask] = 0.0
+
+                # Immediately repair recursive output (res) if needed
+                if res is not None:
+                    with torch.no_grad():
+                        mask = torch.isnan(res)
+                        if mask.any():
+                            print("[repair] NaNs detected in recursive output (res). Clamping...")
+                            res.data[mask] = 0.0
 
                 logits = logits[:, :inp.size(1), :]
                 
