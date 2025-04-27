@@ -495,7 +495,7 @@ for epoch in range(num_epochs):
             ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
             # compute contrastive logits separately, no autograd tracking
             with torch.no_grad():
-                contrast_logits, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
+                contrast_logits, _, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
                 contrastive_loss_val = contrastive_loss(logits, contrast_logits)
 
                 # === Rescue if contrastive loss collapses ===
@@ -642,7 +642,7 @@ for epoch in range(num_epochs):
             # 2) inner token‑only loop
             for _ in range(5):
                 # Forward pass
-                logits, res, flux_penalty = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
+                logits, res, flux_penalty, _ = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
 
                 # Immediately repair resonant tokens if needed
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
