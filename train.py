@@ -180,6 +180,8 @@ model = EnhancedResonantTransformer(
 ).to(DEVICE)
 model.train()
 
+dynamic_attn_cap = max(10, int(0.5 * model.num_layers * model.num_heads))
+
 torch.autograd.set_detect_anomaly(True)
 
 scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
@@ -203,6 +205,10 @@ def attn_hook(module, inp, output):
     # output is (attn_output, attn_weights)
     if isinstance(output, tuple) and output[1] is not None:
         attn_records.append(output[1].detach())
+        # Dynamically cap attn_records
+        if len(attn_records) > dynamic_attn_cap:
+            del attn_records[0]
+
 if not baseline and lambda_attn != 0:
     for layer in model.encoder_layers:
         layer.register_forward_hook(attn_hook)
