@@ -42,6 +42,10 @@ def soft_project_onto_hypersphere(x, target_radius=1.0, tolerance=0.25, strength
 
     return x * (1 - strength * mask) + corrected * (strength * mask)
 
+def hard_project_onto_hypersphere(x, radius=1.0, eps=1e-8):
+    norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
+    return x / norm * radius
+
 # === Hyperparameters & Config ===
 from config import (
     baseline,
@@ -345,7 +349,7 @@ for epoch in range(num_epochs):
                     model._res_tokens_for_ri.data = torch.nan_to_num(model._res_tokens_for_ri.data, nan=0.0, posinf=1.0, neginf=-1.0)
             # Soft project to maintain healthy norms
             with torch.no_grad():
-                model._res_tokens_for_ri.data = soft_project_onto_hypersphere(
+                model._res_tokens_for_ri.data = hard_project_onto_hypersphere(
                     model._res_tokens_for_ri.data,
                     target_radius=0.5,   # consistent with your normal scaling
                     tolerance=0.25,      # allow some breathing room
@@ -384,7 +388,10 @@ for epoch in range(num_epochs):
                 logits, res, _, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
             steps = getattr(model, "last_recursive_steps", 0)
             logits = logits[:,:inp.size(1)]
-            primary = crit(logits.reshape(-1,logits.size(-1)), tgt.reshape(-1))
+            if logits.abs().max() > 10.0:
+                print("[logits_stabilize] Warning: clamping logits to [-10, 10].")
+                logits = torch.clamp(logits, min=-10.0, max=10.0)
+            primary = crit(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
 
             # Create dummy connection between primary and _res_tokens_for_ri
             if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
