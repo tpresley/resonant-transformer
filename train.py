@@ -59,7 +59,7 @@ from config import (
     multihead_resonance,
     max_recursive_steps,
     recursive_convergence_tolerance,
-    flux_penalty_weight
+    flux_penalty_weight, lambda_resonant_attention
 )
 
 if baseline:
@@ -487,6 +487,23 @@ for epoch in range(num_epochs):
                 con = contrastive_loss(logits, contrast_logits)
         else:
             con = torch.tensor(0.0, device=DEVICE)
+
+        # — New: Resonant token attention reward —
+        if not baseline and attn_records:
+            avg_attn_map = torch.stack(attn_records).mean(0)  # [batch, heads, seq, seq]
+            # Average over heads
+            avg_attn_map = avg_attn_map.mean(dim=1)  # [batch, seq, seq]
+            num_resonant_tokens = getattr(model, '_res_tokens_for_ri', torch.empty(0)).size(1)
+            if num_resonant_tokens > 0:
+                # Only consider attention toward resonant token indices
+                attn_to_resonants = avg_attn_map[:, :, :num_resonant_tokens].sum(dim=-1).mean()
+                # Reward larger attention to resonants
+                attn_bonus = attn_to_resonants
+                primary = primary - lambda_resonant_attention * attn_bonus
+            else:
+                attn_bonus = torch.tensor(0.0, device=DEVICE)
+        else:
+            attn_bonus = torch.tensor(0.0, device=DEVICE)
 
         # — Entropy bonus (discourage low‑entropy repetition) —
         if not baseline:
