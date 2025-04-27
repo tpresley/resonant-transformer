@@ -350,6 +350,7 @@ class EnhancedResonantTransformer(nn.Module):
         total_flux_penalty = torch.tensor(0.0, device=x.device)  # Accumulate excess flux
 
         previous_hidden = None
+        hidden_steps = []  # track hidden states across steps
 
         for step in range(num_steps):
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
@@ -358,6 +359,12 @@ class EnhancedResonantTransformer(nn.Module):
             res = repair_if_invalid(res, name="resonant output", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
             hidden = repair_if_invalid(hidden, name="hidden state", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
             context = repair_if_invalid(context, name="context vector", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+
+            # === Inject low-rank structured noise into context ===
+            if self.training and context is not None:
+                structured_noise = (torch.randn_like(context) * 0.05)
+                structured_noise = F.normalize(structured_noise, dim=-1) * 0.05
+                context = context + structured_noise
 
             # === Tiny noise injection to hidden states to maintain diversity ===
             if self.training:
@@ -370,6 +377,7 @@ class EnhancedResonantTransformer(nn.Module):
 
             # Normalize hidden immediately after blending
             hidden = F.layer_norm(hidden, (hidden.size(-1),))
+            hidden_steps.append(hidden.detach())  # store step hidden
             
             previous_hidden = hidden.detach()  # update stored hidden
 
@@ -520,7 +528,14 @@ class EnhancedResonantTransformer(nn.Module):
             self.train()
             torch.set_grad_enabled(True)
 
-        return logits, hidden, total_flux_penalty.detach()
+        hidden_contrastive_loss = torch.tensor(0.0, device=x.device)
+        if len(hidden_steps) >= 2:
+            for i in range(len(hidden_steps) - 1):
+                diff = (hidden_steps[i] - hidden_steps[i + 1]).pow(2).mean()
+                hidden_contrastive_loss += diff
+            hidden_contrastive_loss = hidden_contrastive_loss / (len(hidden_steps) - 1)
+
+        return logits, hidden, total_flux_penalty.detach(), hidden_contrastive_loss.detach()
 
 
 

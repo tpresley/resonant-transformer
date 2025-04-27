@@ -310,6 +310,9 @@ for epoch in range(num_epochs):
 
         opt = torch.optim.Adam(param_groups)
 
+        # === Boost resonant token attention incentive ===
+        lambda_resonant_attention *= 2.0
+
         # === Force a refresh of _res_tokens_for_ri ===
         if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
             with torch.no_grad():
@@ -376,7 +379,7 @@ for epoch in range(num_epochs):
                 fade_in_steps = model.max_recursive_steps - 1  # The newly added step
                 fade_in_strength = min(1.0, bidx / len(loader))
 
-                logits, res, flux_penalty = model.recursive_forward(
+                logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
                     inp, ctx,
                     tol=recursive_convergence_tolerance,
                     padding_mask=padding_mask,
@@ -570,7 +573,7 @@ for epoch in range(num_epochs):
             model._res_tokens_for_ri.grad = None
 
         
-        final = (primary - penalty + term3 + term4) + con if not baseline else primary
+        final = (primary - penalty + term3 + term4 + 0.05 * hidden_contrastive_loss) + con if not baseline else primary
 
         # === ADDITION: small constant diversity encouragement every batch ===
         if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
