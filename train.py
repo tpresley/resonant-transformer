@@ -490,14 +490,11 @@ for epoch in range(num_epochs):
 
         # — New: Resonant token attention reward —
         if not baseline and attn_records:
-            avg_attn_map = torch.stack(attn_records).mean(0)  # [batch, heads, seq, seq]
-            # Average over heads
-            avg_attn_map = avg_attn_map.mean(dim=1)  # [batch, seq, seq]
+            avg_attn_map = torch.stack(attn_records).mean(0)  # [batch, seq, seq]
             num_resonant_tokens = getattr(model, '_res_tokens_for_ri', torch.empty(0)).size(1)
-            if num_resonant_tokens > 0 and avg_attn_map.size(2) >= num_resonant_tokens:
+            if num_resonant_tokens > 0 and avg_attn_map.size(-1) >= num_resonant_tokens:
                 # Only consider attention towards resonant token positions
-                attn_to_resonants = avg_attn_map[:, :, :num_resonant_tokens].sum(dim=-1)  # [batch, seq]
-                attn_bonus = attn_to_resonants.mean()
+                attn_bonus = avg_attn_map[:, :, :num_resonant_tokens].sum(dim=-1).mean()
                 primary = primary - lambda_resonant_attention * attn_bonus
             else:
                 attn_bonus = torch.tensor(0.0, device=DEVICE)
