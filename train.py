@@ -503,7 +503,7 @@ for epoch in range(num_epochs):
                 if contrastive_loss_val.item() < min_contrastive_loss:
                     rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0  # adjustable
                     contrastive_loss_val = contrastive_loss_val + rescue_boost
-                    print(f"[contrastive_loss_rescue] Boosted contrastive loss by {rescue_boost:.6f}")
+                    # print(f"[contrastive_loss_rescue] Boosted contrastive loss by {rescue_boost:.6f}")
                 con = contrastive_loss_val
         else:
             con = torch.tensor(0.0, device=DEVICE)
