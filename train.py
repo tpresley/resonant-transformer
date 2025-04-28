@@ -189,6 +189,8 @@ def build_model(config, tokenizer, device):
         for layer in model.encoder_layers:
             layer.register_forward_hook(attn_hook)
 
+    model.attn_records = attn_records
+
     return model, scaler, attn_records
 
 # === 8. Optimizer and Scheduler Setup ===
@@ -446,7 +448,7 @@ def train(model, loader, opt, scheduler, config, device, tokenizer):
     res_baseline = None
     global_repair_counter = {"logits": 0, "resonant output": 0, "hidden state": 0, "context vector": 0}
     skip_counts = {"entropy_loss": 0, "surprisal_loss": 0, "resolution_loss": 0}
-    attn_records = []
+    attn_records = getattr(model, "attn_records", [])
     current_recursive_target_steps = 2 if not config["baseline"] else 1
     fade_in_progress = 0.0
 
