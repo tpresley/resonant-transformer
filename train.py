@@ -173,7 +173,7 @@ def build_model(config, tokenizer, device):
     scaler = GradScaler(enabled=(device.type == "cuda"))
     attn_records = []
 
-    attn_momentum = 0.99
+    attn_momentum = 0.95
     def attn_hook(module, inp, output):
         if isinstance(output, tuple) and output[1] is not None:
             attn_out = output[1].detach()
@@ -262,12 +262,20 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         primary = primary - config["lambda_sur"] * sur_reward
 
         if attn_records and hasattr(model, "avg_attn"):
-            ca = torch.stack(attn_records).mean(0)
-            cur, avg = ca.mean(0) + 1e-8, model.avg_attn + 1e-8
-            akl = F.kl_div(cur.log(), avg, reduction='batchmean')
+            eps = 1e-5  # slightly larger epsilon
+            ca = torch.stack(attn_records).mean(0)  # average across recursion steps
+            cur = ca.mean(0)  # average across batch
+            avg = model.avg_attn
+
+            akl = (cur * ((cur + eps) / (avg + eps)).log()).sum(-1).mean()
+
             akl = torch.clamp(akl, max=0.1)
             primary = primary - config["lambda_attn"] * akl
-            model.avg_attn = avg
+
+            # Update moving average correctly
+            momentum = 0.95
+            model.avg_attn = momentum * model.avg_attn + (1 - momentum) * cur.detach()
+
             del attn_records[:]
 
         if logits.size(1) >= 2:
@@ -412,22 +420,27 @@ def train(model, loader, opt, scheduler, config, device, tokenizer):
     global_repair_counter = {"logits": 0, "resonant output": 0, "hidden state": 0, "context vector": 0}
     skip_counts = {"entropy_loss": 0, "surprisal_loss": 0, "resolution_loss": 0}
     attn_records = []
+    current_recursive_target_steps = 2 if not config["baseline"] else 1
+    fade_in_progress = 0.0
+
     for epoch in range(config["num_epochs"]):
-        last_res, sur_baseline, res_baseline = train_epoch(
+        last_res, sur_baseline, res_baseline, current_recursive_target_steps, fade_in_progress = train_epoch(
             model, loader, opt, scheduler, config, device, epoch,
             last_res, sur_baseline, res_baseline,
-            global_repair_counter, skip_counts, attn_records,
-            tokenizer
+            current_recursive_target_steps=current_recursive_target_steps,
+            fade_in_progress=fade_in_progress,
+            global_repair_counter=global_repair_counter,
+            skip_counts=skip_counts,
+            attn_records=attn_records,
+            tokenizer=tokenizer
         )
         if (epoch + 1) % 10 == 0:
             save_checkpoint(model, opt, config, epoch)
     save_final_model(model, config, last_res)
 
 
-def train_epoch(model, loader, opt, scheduler, config, device, 
-                epoch, last_res, sur_baseline, res_baseline, 
-                global_repair_counter, skip_counts, attn_records, 
-                tokenizer):
+def train_epoch(model, loader, opt, scheduler, config, device, epoch, last_res, sur_baseline, res_baseline, global_repair_counter, skip_counts, attn_records,
+                current_recursive_target_steps, fade_in_progress, tokenizer):
     
     print(f"Start Epoch {epoch+1}/{config['num_epochs']}")
 
@@ -437,73 +450,76 @@ def train_epoch(model, loader, opt, scheduler, config, device,
     model.train()
     model.alpha = cosine_rampup(epoch, config["warmup_epochs"])
     
-    if epoch >= config["warmup_epochs"] and hasattr(model, "max_recursive_steps") and model.max_recursive_steps < config["max_recursive_steps"]:
-        model.max_recursive_steps += 1
+    if not config["baseline"]:
+        if epoch >= config["warmup_epochs"] and hasattr(model, "max_recursive_steps") and model.max_recursive_steps < config["max_recursive_steps"]:
+            model.max_recursive_steps += 1
 
-    if epoch == config["warmup_epochs"] and hasattr(model, 'resonant_attention_scale'):
-        model.resonant_attention_scale *= 2
-    
-    if epoch == config["warmup_epochs"]:
-        print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
-        
-        # Enable grads for resonant-related parameters
-        for name, param in model.named_parameters():
-            param.requires_grad_(True)
-
-        # Rebuild optimizer with resonant token params at boosted LR
-        param_groups = [
-            {
-                'params': [p for n, p in model.named_parameters()
-                           if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
-                'lr': config["learning_rate"]
-            }
-        ]
-        if config["resonant_token_count"] > 0:
-            param_groups.append({
-                'params': [model.resonant_tokens],
-                'lr': config["learning_rate"] * config["token_learning_amplifier"]
-            })
-        if config["dynamic_resonant_token_count"] > 0:
-            param_groups.append({
-                'params': model.controller.parameters(),
-                'lr': config["learning_rate"] * config["token_learning_amplifier"]
-            })
-        if config["multihead_resonance"]:
-            param_groups.append({
-                'params': model.resonator.parameters(),
-                'lr': config["learning_rate"] * config["token_learning_amplifier"]
-            })
-
-        opt.param_groups.clear()
-        opt.add_param_group(param_groups[0])
-        if len(param_groups) > 1:
-            for group in param_groups[1:]:
-                opt.add_param_group(group)
-
-        if hasattr(model, 'resonant_attention_scale'):
+        if epoch == config["warmup_epochs"] and hasattr(model, 'resonant_attention_scale'):
             model.resonant_attention_scale *= 2
+        
+        if epoch == config["warmup_epochs"]:
+            print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
+            
+            # Enable grads for resonant-related parameters
+            for name, param in model.named_parameters():
+                param.requires_grad_(True)
 
-        # Clamp resonant tokens cleanly after enabling
-        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            with torch.no_grad():
-                model._res_tokens_for_ri.clamp_(-1.0, 1.0)
-                model._res_tokens_for_ri.requires_grad_(True)
+            # Rebuild optimizer with resonant token params at boosted LR
+            param_groups = [
+                {
+                    'params': [p for n, p in model.named_parameters()
+                            if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+                    'lr': config["learning_rate"]
+                }
+            ]
+            if config["resonant_token_count"] > 0:
+                param_groups.append({
+                    'params': [model.resonant_tokens],
+                    'lr': config["learning_rate"] * config["token_learning_amplifier"]
+                })
+            if config["dynamic_resonant_token_count"] > 0:
+                param_groups.append({
+                    'params': model.controller.parameters(),
+                    'lr': config["learning_rate"] * config["token_learning_amplifier"]
+                })
+            if config["multihead_resonance"]:
+                param_groups.append({
+                    'params': model.resonator.parameters(),
+                    'lr': config["learning_rate"] * config["token_learning_amplifier"]
+                })
+
+            opt.param_groups.clear()
+            opt.add_param_group(param_groups[0])
+            if len(param_groups) > 1:
+                for group in param_groups[1:]:
+                    opt.add_param_group(group)
+
+            if hasattr(model, 'resonant_attention_scale'):
+                model.resonant_attention_scale *= 2
+
+            # Clamp resonant tokens cleanly after enabling
+            if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+                with torch.no_grad():
+                    model._res_tokens_for_ri.clamp_(-1.0, 1.0)
+                    model._res_tokens_for_ri.requires_grad_(True)
 
     for batch_idx, (batch, lengths) in enumerate(loader):
-        last_res, sur_baseline, res_baseline = train_batch(
+        last_res, sur_baseline, res_baseline, fade_in_progress, current_recursive_target_steps = train_batch(
             model, batch, lengths, opt, scheduler, config, device, epoch, batch_idx,
             last_res, sur_baseline, res_baseline,
             global_repair_counter, skip_counts, attn_records,
+            fade_in_progress=fade_in_progress,
+            current_recursive_target_steps=current_recursive_target_steps,
             loader_len=len(loader),
             tokenizer=tokenizer
         )
-    return last_res, sur_baseline, res_baseline
+    return last_res, sur_baseline, res_baseline, current_recursive_target_steps, fade_in_progress
 
 
 
 def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, batch_idx,
                 last_res, sur_baseline, res_baseline, global_repair_counter, skip_counts,
-                attn_records, loader_len, tokenizer):
+                attn_records, loader_len, tokenizer, fade_in_progress, current_recursive_target_steps):
 
     model.excess_flux_count = 0
 
@@ -513,20 +529,23 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     ctx = last_res if last_res is not None else inp
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
-    fade_in_strength = 1.0
-    if not config["baseline"]:
-        # === Calculate smooth fade_in_strength for recursive steps ===
+    if config["baseline"]:
+        fade_in_strength = 1.0
+    else:
         if epoch < config["warmup_epochs"]:
-            fade_in_strength = cosine_rampup(epoch + batch_idx / len(loader), config["warmup_epochs"])
+            fade_in_strength = cosine_rampup(epoch + batch_idx / loader_len, config["warmup_epochs"])
+            current_recursive_target_steps = 2
         else:
-            base_steps = 2
-            added_steps = model.max_recursive_steps - base_steps
-            if added_steps <= 0:
-                fade_in_strength = 1.0
-            else:
-                epochs_since_warmup = (epoch - config["warmup_epochs"]) + (batch_idx / len(loader))
-                total_fade_time = added_steps * 5.0
-                fade_in_strength = min(1.0, max(0.0, epochs_since_warmup / total_fade_time))
+            fade_in_progress += 1.0 / (5.0 * loader_len)  # 5 epochs per new step
+            fade_in_progress = min(fade_in_progress, 1.0)
+            fade_in_strength = fade_in_progress
+
+            if fade_in_progress >= 0.999 and model.max_recursive_steps < config["max_recursive_steps"]:
+                print(f"[recursive-step] Adding new recursive step at epoch {epoch}, batch {batch_idx}")
+                model.max_recursive_steps += 1
+                current_recursive_target_steps += 1
+                fade_in_progress = 0.0  # Reset ramping for next new step
+
 
     if config["baseline"]:
         baseline_outputs = model.forward(inp, context=ctx, padding_mask=padding_mask)
@@ -665,7 +684,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         for p in model.parameters():
             p.requires_grad_(True)
 
-    return last_res, sur_baseline, res_baseline
+    return last_res, sur_baseline, res_baseline, fade_in_progress, current_recursive_target_steps
 
 
 
