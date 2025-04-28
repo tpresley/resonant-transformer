@@ -260,7 +260,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         if sur_baseline is None:
             sur_baseline = sur.detach()
         else:
-            sur_baseline = 0.99 * sur_baseline + 0.01 * sur.detach()
+            sur_baseline = 0.90 * sur_baseline + 0.10 * sur.detach()
 
         sur_reward = sur - sur_baseline
         primary = primary - config["lambda_sur"] * sur_reward
@@ -300,7 +300,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             if res_baseline is None:
                 res_baseline = rr.detach()
             else:
-                res_baseline = 0.99 * res_baseline + 0.01 * rr.detach()
+                res_baseline = 0.90 * res_baseline + 0.10 * rr.detach()
 
             res_reward = rr - res_baseline
             primary = primary - config["lambda_res"] * res_reward
@@ -612,11 +612,12 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                 print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
                 model._res_tokens_for_ri.data[mask] = 0.0
 
-            # Soft project onto hypersphere
-            model._res_tokens_for_ri.data = hard_project_onto_hypersphere(
+            # Soft project onto hypersphere (in-place so we don’t break the grad graph)
+            new_proj = hard_project_onto_hypersphere(
                 model._res_tokens_for_ri.data,
                 radius=1.0
             )
+            model._res_tokens_for_ri.data.copy_(new_proj)
 
     if res is not None:
         with torch.no_grad():
@@ -641,7 +642,9 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     )
 
     opt.zero_grad()
-    primary.backward()
+    # include contrastive loss so it actually influences gradients
+    total_loss = primary + con
+    total_loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     opt.step()
 
