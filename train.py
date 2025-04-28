@@ -235,6 +235,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
     primary = crit(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
 
     con = penalty = sur_reward = akl = res_reward = dvt = torch.tensor(0.0, device=device)
+    # Ramp diversity weight from 0 → λ_div over the full training run
+    diversity_weight = min(config["lambda_div"] * (epoch / config["num_epochs"]), config["lambda_div"])
 
     if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
         dvt = diversity_penalty(model._res_tokens_for_ri)
@@ -324,11 +326,10 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             gr_tuple = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=True, allow_unused=True)
             gr = gr_tuple[0]
             if gr is not None:
-                gn = gr.norm(dim=-1).clamp(min=1e-6)
                 penalty = (
-                    config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
+                    config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean()
                     + config["lambda_rs"] * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-                    + config["lambda_div"] * diversity_penalty(model._res_tokens_for_ri)
+                    + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
                 )
 
         primary = primary - penalty
@@ -433,7 +434,7 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
           f"PPL: {ppl:.2f} | NORM: {res_token_norm:.2f} | "
           f"SUR: {sur_reward.item():.4f} | AKL: {akl.item():.4f} | "
           f"RES: {res_reward.item():.4f} | "
-          f"RI: {ri_val:.4e} | RSC: {rs_cos_val:.4e} | "
+          f"RI: {ri_val:.4e} | RS: {rs_val:.4e} | RS_COS: {rs_cos_val:.4e} | "
           f"SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | "
           f"REPAIRS: {vector_repairs}")
 
@@ -645,7 +646,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                     ctx, epoch, batch_idx, loader_len, config, skip_counts, 
                     global_repair_counter)
 
-    if scheduler is not None:
+    if scheduler is not None and epoch >= config["warmup_epochs"]:
         scheduler.step()
 
     last_res = res
