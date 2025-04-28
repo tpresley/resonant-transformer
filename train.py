@@ -378,14 +378,17 @@ for epoch in range(num_epochs):
         with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
             if not baseline:
 
-                fade_in_steps = model.max_recursive_steps - 1  # The newly added step
-                fade_in_strength = min(1.0, bidx / len(loader))
+                # === fade_in_strength smoothly rises from 0 to 1 after warmup ===
+                if epoch >= warmup_epochs:
+                    fade_in_strength = (epoch - warmup_epochs + bidx / len(loader)) / 5.0  # spread over 5 epochs
+                    fade_in_strength = min(1.0, max(0.0, fade_in_strength))
+                else:
+                    fade_in_strength = 0.0
 
                 logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
                     inp, ctx,
                     tol=recursive_convergence_tolerance,
                     padding_mask=padding_mask,
-                    fade_in_steps=fade_in_steps,
                     fade_in_strength=fade_in_strength
                 )
 

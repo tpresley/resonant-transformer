@@ -173,6 +173,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.attn_kl_ema = torch.tensor(1.0)
         self.resolution_ema = torch.tensor(1.0)
         self.ema_alpha = 0.01  # You can tune this, but it's stable and general
+        self.recursion_feedback_strength = 1.0
 
 
         if self.dynamic_resonant_token_count > 0:
@@ -310,7 +311,7 @@ class EnhancedResonantTransformer(nn.Module):
 
         return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
-    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None, inference_mode=False, fade_in_steps=None, fade_in_strength=1.0):
+    def recursive_forward(self, x, context=None, max_steps=None, tol=1e-5, padding_mask=None, inference_mode=False, fade_in_strength=1.0):
         """
         Full recursive inference with:
         - entropy / resolution / attention tracking
@@ -376,9 +377,10 @@ class EnhancedResonantTransformer(nn.Module):
                 noise_strength = 1e-3  # adjustable: lower = safer
                 hidden = hidden + noise_strength * torch.randn_like(hidden)
 
-            # === Soft fade-in for newly added recursion steps ===
-            if fade_in_steps is not None and step >= fade_in_steps:
-                hidden = (1.0 - fade_in_strength) * previous_hidden + fade_in_strength * hidden
+            # === Soft fade-in for all recursive steps after warmup ===
+            if previous_hidden is not None:
+                feedback_strength = self.recursion_feedback_strength * fade_in_strength
+                hidden = (1.0 - feedback_strength) * previous_hidden + feedback_strength * hidden
 
             # Normalize hidden immediately after blending
             hidden = F.layer_norm(hidden, (hidden.size(-1),))
@@ -486,6 +488,7 @@ class EnhancedResonantTransformer(nn.Module):
                 old_context_vec = new_context_vec
 
             context_vec_ema = ema_decay * old_context_vec + (1 - ema_decay) * new_context_vec
+            context_vec_ema = (1.0 - feedback_strength) * old_context_vec + feedback_strength * context_vec_ema
             context_vec_ema = F.layer_norm(context_vec_ema, (context_vec_ema.size(-1),))
 
             # === Track context flux for bonus ===
