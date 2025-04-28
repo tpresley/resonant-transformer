@@ -357,6 +357,19 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
     excess_flux_count = getattr(model, "excess_flux_count", 0)
     loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
     vector_repairs = sum(global_repair_counter.values())
+
+    # === Compute RI / RS / RS_COS from resonant-token gradients ===
+    ri_val, rs_val, rs_cos_val = 0.0, 0.0, 0.0
+    if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+        grad = model._res_tokens_for_ri.grad
+        if grad is not None:
+            # RI = <g, r> magnitude
+            ri_val = (grad * model._res_tokens_for_ri).sum(dim=-1).abs().mean().item()
+            # cosine similarity between g and r
+            cos_sim = F.cosine_similarity(grad, model._res_tokens_for_ri, dim=-1)
+            rs_val = (1.0 - cos_sim).mean().item()
+            rs_cos_val = cos_sim.mean().item()
+
     self_attn_mean = model.attention_trajectory[-1] if hasattr(model, "attention_trajectory") and model.attention_trajectory else 0.0
     recursive_steps = getattr(model, "last_recursive_steps", 0)
     last_flux_cost = getattr(model, "last_flux_cost", 0.0)
@@ -400,6 +413,9 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
         'entropy_loss_skips': skip_counts["entropy_loss"],
         'surprisal_loss_skips': skip_counts["surprisal_loss"],
         'resolution_loss_skips': skip_counts["resolution_loss"],
+        'ri': ri_val,
+        'rs': rs_val,
+        'rs_cos': rs_cos_val,
         'repairs_logits': global_repair_counter["logits"],
         'repairs_resonant_output': global_repair_counter["resonant output"],
         'repairs_hidden_state': global_repair_counter["hidden state"],
@@ -411,10 +427,13 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
         'flux_budget': flux_budget,
     }, step=global_step)
 
-    print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {batch_idx} - PPL: {ppl:.2f} | NORM: {res_token_norm:.2f} | "
-          f"SUR: {sur_reward.item() if sur_reward is not None else 0.0:.4f} | AKL: {akl.item() if akl is not None else 0.0:.4f} | "
-          f"RES: {res_reward.item() if res_reward is not None else 0.0:.4f} | "
-          f"RI: 0.0 | RSC: 0.0 | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | REPAIRS: {vector_repairs}")
+    print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {batch_idx} - "
+          f"PPL: {ppl:.2f} | NORM: {res_token_norm:.2f} | "
+          f"SUR: {sur_reward.item():.4f} | AKL: {akl.item():.4f} | "
+          f"RES: {res_reward.item():.4f} | "
+          f"RI: {ri_val:.4e} | RSC: {rs_cos_val:.4e} | "
+          f"SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | "
+          f"REPAIRS: {vector_repairs}")
 
 
 
