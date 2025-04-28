@@ -260,7 +260,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         if sur_baseline is None:
             sur_baseline = sur.detach()
         else:
-            sur_baseline = 0.90 * sur_baseline + 0.10 * sur.detach()
+            sur_baseline = 0.80 * sur_baseline + 0.20 * sur.detach()
 
         sur_reward = sur - sur_baseline
         primary = primary - config["lambda_sur"] * sur_reward
@@ -300,7 +300,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             if res_baseline is None:
                 res_baseline = rr.detach()
             else:
-                res_baseline = 0.90 * res_baseline + 0.10 * rr.detach()
+                res_baseline = 0.80 * res_baseline + 0.20 * rr.detach()
 
             res_reward = rr - res_baseline
             primary = primary - config["lambda_res"] * res_reward
@@ -309,7 +309,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         ci[:, -1] = torch.randint(0, logits.size(-1), (inp.size(0),), device=device)
         with torch.no_grad():
             contrast_logits, _, _, _ = model.recursive_forward(ci, ci, tol=config["recursive_convergence_tolerance"])
-            contrastive_loss_val = contrastive_loss(logits, contrast_logits)
+            # use a larger margin so contrastive_loss doesn’t collapse to 0 immediately
+            contrastive_loss_val = contrastive_loss(logits, contrast_logits, margin=5.0)
             min_contrastive_loss = 1e-4
             if contrastive_loss_val.item() < min_contrastive_loss:
                 rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0
@@ -591,6 +592,8 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         )
         # grab the actual resonant-token output (was formerly the 2nd return)
         res = model._res_tokens_for_ri
+        # ensure we’ll see its gradient after backward
+        res.retain_grad()
 
     if batch_idx % 10 == 0:
         global_step = epoch * len(loader) + batch_idx
