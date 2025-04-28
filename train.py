@@ -559,24 +559,25 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
     if config["baseline"]:
+        # no recursion for baseline
         fade_in_strength = 1.0
     else:
-        if epoch < config["warmup_epochs"]:
-            fade_in_strength = cosine_rampup(epoch + batch_idx / loader_len, config["warmup_epochs"])
-            current_recursive_target_steps = 2
-        else:
-            # after warmup: advance the fade‐in clock
-            fade_in_progress += 1.0 / (5.0 * loader_len)
-            # once we've ramped to (or past) 1.0, add a new step and wrap the overflow
-            if fade_in_progress >= 1.0 and model.max_recursive_steps < config["max_recursive_steps"]:
-                print(f"[recursive-step] Adding new recursive step at epoch {epoch}, batch {batch_idx}")
-                model.max_recursive_steps += 1
-                current_recursive_target_steps += 1
-                fade_in_progress -= 1.0
-            # clamp into [0,1)
-            fade_in_progress = max(0.0, min(fade_in_progress, 1.0 - 1e-6))
-            # now use the *new* progress as strength
-            fade_in_strength = fade_in_progress
+        # Epoch‐based staging: each block of warmup_epochs adds one new step, ramping its influence over that block
+        W = config["warmup_epochs"]
+        final_steps = config["max_recursive_steps"]
+        init_steps = 2
+        # global fractional epoch count
+        P = epoch + batch_idx / loader_len
+        # which stage/block we're in
+        stage = int(P // W)
+        # clamp to max additional steps
+        max_stage = max(0, final_steps - init_steps)
+        stage = min(stage, max_stage)
+        # set the number of recursive steps
+        model.max_recursive_steps = init_steps + stage
+        # compute fade‐in for the current stage: 0→1 over W epochs
+        frac = (P - stage * W) / W
+        fade_in_strength = float(min(max(frac, 0.0), 1.0))
 
 
     if config["baseline"]:
