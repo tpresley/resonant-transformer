@@ -270,13 +270,8 @@ class EnhancedResonantTransformer(nn.Module):
             ], dim=1)
 
         if tokens.numel() > 0:
-            # detach history but keep a pure-leaf for RI/RS gradients
-            if self.training:
-                self._res_tokens_for_ri = tokens.detach().requires_grad_(True)
-            else:
-                self._res_tokens_for_ri = tokens.requires_grad_()
-            # make sure .grad is populated
-            self._res_tokens_for_ri.retain_grad()
+            # keep full graph history so gradients reach resonant_tokens & controller
+            self._res_tokens_for_ri = tokens.requires_grad_(True)
         else:
             self._res_tokens_for_ri = tokens  # empty tensor
 

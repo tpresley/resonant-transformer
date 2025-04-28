@@ -38,7 +38,7 @@ def prepare_environment():
         sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
-        flux_penalty_weight, lambda_resonant_attention
+        flux_penalty_weight
     )
     if baseline:
         resonant_token_count = 0
@@ -59,7 +59,7 @@ def prepare_environment():
         "lambda_sur": lambda_sur, "lambda_attn": lambda_attn, "lambda_res": lambda_res,
         "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
         "recursive_convergence_tolerance": recursive_convergence_tolerance,
-        "flux_penalty_weight": flux_penalty_weight, "lambda_resonant_attention": lambda_resonant_attention
+        "flux_penalty_weight": flux_penalty_weight
     }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
@@ -323,17 +323,22 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
         primary = primary - 1e-4 * ent_loss
 
-        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            gr_tuple = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=True, allow_unused=True)
-            gr = gr_tuple[0]
-            if gr is not None:
-                penalty = (
-                    config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean()
-                    + config["lambda_rs"] * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-                    + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
-                )
+        # if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+        #     gr_tuple = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=True, allow_unused=True)
+        #     gr = gr_tuple[0]
+        #     if gr is not None:
+        #         penalty = (
+        #             config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean()
+        #             + config["lambda_rs"] * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
+        #             + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
+        #         )
 
+        # primary = primary - penalty
+
+        # Manual autograd.grad hack removed – resonant-token penalties
+        # will now flow via the inner-loop/backward pass.
         primary = primary - penalty
+
         primary = primary + 0.05 * hidden_contrastive_loss
         primary = primary + config["flux_penalty_weight"] * flux_penalty
 
@@ -343,7 +348,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
 
 
 # === 10. Logging ===
-def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoch, batch_idx, loader_len, config, skip_counts, global_repair_counter):
+def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoch, batch_idx, loader_len, config, skip_counts, global_repair_counter):
     import numpy as np
     now = time.time()
     if not hasattr(log_metrics, "_last_log_time"):
@@ -352,7 +357,7 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
     log_metrics._last_log_time = now
 
     global_step = epoch * loader_len + batch_idx
-    ppl = float(np.exp(primary.item())) if primary.item() < 100 else float('inf')
+    # ppl = float(np.exp(primary.item())) if primary.item() < 100 else float('inf')
 
     res_token_norm = 0.0
     stat_norm = 0.0
@@ -643,7 +648,15 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                 res.clamp_(min=-10.0, max=10.0)
 
     # strip off resonant tokens
-    logits = logits[:, :inp.size(1)]
+    logits = logits[:, 1:1 + inp.size(1)]
+
+    # compute raw CE for correct PPL logging before any augmentations
+    ce_loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        tgt.reshape(-1),
+        ignore_index=tokenizer.token_to_id("<pad>")
+    )
+    ppl = float(torch.exp(ce_loss))
 
     primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline = compute_losses(
         model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
@@ -659,7 +672,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     opt.step()
 
     if batch_idx % 10 == 0:
-        log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, 
+        log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, 
                     ctx, epoch, batch_idx, loader_len, config, skip_counts, 
                     global_repair_counter)
 
