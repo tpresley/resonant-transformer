@@ -1,882 +1,703 @@
-# train.py (fully updated with proper RI/RS integration)
+# Unified train.py (Fully Refactored Version)
+
+# === 0. Imports ===
 import os
+import time
 import torch
 import wandb
-import numpy as np
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from datasets import load_dataset
 from resonantTransformer import EnhancedResonantTransformer, diversity_penalty, cosine_rampup, contrastive_loss
-from sklearn.decomposition import PCA
-from collections import deque
-import pandas as pd
-import plotly.express as px
-import time
 from torch.amp import autocast, GradScaler
 
-def collate_dynamic(batch):
-    lengths = [len(x) for x in batch]
-    max_len = max(lengths)
-    pad_id = tokenizer.token_to_id("<pad>")
-    padded = [x + [pad_id] * (max_len - len(x)) for x in batch]
-    return torch.tensor(padded, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
 
+
+# === 1. Utility Functions ===
 def soft_project_onto_hypersphere(x, target_radius=1.0, tolerance=0.25, strength=0.1, eps=1e-6):
-    """
-    Softly nudges x toward a hypersphere of radius `target_radius`.
-    
-    Args:
-        x: input tensor [..., d]
-        target_radius: desired norm
-        tolerance: allowed deviation before correction
-        strength: interpolation factor (0 = no correction, 1 = hard projection)
-    """
     norms = x.norm(dim=-1, keepdim=True).clamp(min=eps)
     deviation = (norms - target_radius).abs()
-
-    mask = (deviation > tolerance).float()  # Only correct if deviation is large
+    mask = (deviation > tolerance).float()
     corrected = target_radius * (x / norms)
-
     return x * (1 - strength * mask) + corrected * (strength * mask)
 
 def hard_project_onto_hypersphere(x, radius=1.0, eps=1e-8):
     norm = x.norm(dim=-1, keepdim=True).clamp(min=eps)
     return x / norm * radius
 
-# === Repair tracker ===
-global_repair_counter = {
-    "logits": 0,
-    "resonant output": 0,
-    "hidden state": 0,
-    "context vector": 0
-}
 
-# === Hyperparameters & Config ===
-from config import (
-    baseline,
-    d_model, num_heads, num_layers, vocab_size, weight_decay,
-    resonant_token_count, dynamic_resonant_token_count,
-    token_learning_amplifier,
-    sequence_length, max_tokens, learning_rate,
-    batch_size, num_epochs, warmup_epochs,
-    lambda_ri, lambda_rs, lambda_div,
-    lambda_sur, lambda_attn, lambda_res,
-    multihead_resonance,
-    max_recursive_steps,
-    recursive_convergence_tolerance,
-    flux_penalty_weight, lambda_resonant_attention
-)
 
-if baseline:
-    resonant_token_count = 0
-    dynamic_resonant_token_count = 0
-    multihead_resonance = False
 
-# Device setup
-DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
-         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-
-token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
-millions = int(max_tokens / 1_000_000)
-run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
-
-# Initialize wandb
-wandb.init(project="resonant-transformer-annealing", name=run_name, config={
-    **{k: v for k, v in locals().items() if k.startswith('lambda_') or k in [
-        'd_model','num_heads','num_layers','resonant_token_count',
-        'dynamic_resonant_token_count','learning_rate','batch_size',
-        'num_epochs','sequence_length','max_tokens','multihead_resonance',
-        'recursive_convergence_tolerance', 'flux_penalty_weight'
-    ]}
-})
-
-print("Prep Data")
-
-# Data preparation (unchanged)
-dataset = load_dataset("roneneldan/TinyStories", split="train")
-corpus_path = "tinystories_cached.txt"
-if not os.path.exists(corpus_path):
-    with open(corpus_path, "w", encoding="utf-8") as f:
-        for entry in dataset:
-            line = entry['text'].strip()
-            if line:
-                f.write(line + "\n")
-
-print("Tokenizer Setup")
-
-# Tokenizer setup
-tokenizer_dir = "tokenizer-tinystories"
-vocab_path = os.path.join(tokenizer_dir, "vocab.json")
-merges_path = os.path.join(tokenizer_dir, "merges.txt")
-
-# Check if both vocab and merges files exist
-if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
-    print("[Tokenizer] Training new tokenizer...")
-    tokenizer = ByteLevelBPETokenizer()
-    tokenizer.train(
-        files=[corpus_path],
-        vocab_size=vocab_size,
-        min_frequency=2,
-        special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
+# === 2. Environment & Config Setup ===
+def prepare_environment():
+    from config import (
+        baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
+        resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
+        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs,
+        lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
+        multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
+        flux_penalty_weight, lambda_resonant_attention
     )
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    tokenizer.save_model(tokenizer_dir)
-else:
-    print("[Tokenizer] Loading existing tokenizer...")
-    tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path)
+    if baseline:
+        resonant_token_count = 0
+        dynamic_resonant_token_count = 0
+        multihead_resonance = False
+    DEVICE = torch.device("mps") if torch.backends.mps.is_available() else (
+             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
+    millions = int(max_tokens / 1_000_000)
+    run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
+    config_dict = {
+        "baseline": baseline, "d_model": d_model, "num_heads": num_heads, "num_layers": num_layers,
+        "vocab_size": vocab_size, "weight_decay": weight_decay, "resonant_token_count": resonant_token_count,
+        "dynamic_resonant_token_count": dynamic_resonant_token_count, "token_learning_amplifier": token_learning_amplifier,
+        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate,
+        "batch_size": batch_size, "num_epochs": num_epochs, "warmup_epochs": warmup_epochs,
+        "lambda_ri": lambda_ri, "lambda_rs": lambda_rs, "lambda_div": lambda_div,
+        "lambda_sur": lambda_sur, "lambda_attn": lambda_attn, "lambda_res": lambda_res,
+        "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
+        "recursive_convergence_tolerance": recursive_convergence_tolerance,
+        "flux_penalty_weight": flux_penalty_weight, "lambda_resonant_attention": lambda_resonant_attention
+    }
+    wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
+    return DEVICE, config_dict
 
-tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
-pad_id = tokenizer.token_to_id("<pad>")
-tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
 
-print("Encode Corpus")
 
-tokens = []
-max_stories = 500_000
-story_count = 0
-buffer = []
-stride = sequence_length // 3
-bos_id = tokenizer.token_to_id("<bos>")
-eos_id = tokenizer.token_to_id("<eos>")
+# === 3. Dataset Preparation ===
+def prepare_dataset(corpus_path="tinystories_cached.txt", max_stories=500_000):
+    print("Prep Data")
+    dataset = load_dataset("roneneldan/TinyStories", split="train")
+    if not os.path.exists(corpus_path):
+        with open(corpus_path, "w", encoding="utf-8") as f:
+            for entry in dataset:
+                line = entry['text'].strip()
+                if line:
+                    f.write(line + "\n")
+    return corpus_path
 
-with open(corpus_path, "r", encoding="utf-8") as f:
-    for line in f:
-        story_count += 1
-        if story_count >= max_stories:
-            break
-        line = line.strip()
-        if line:
-            try:
-                encoded = tokenizer.encode(line)
-            except Exception as e:
-                print("Tokenizer error on line:", repr(line))
-                raise
-            story_tokens = [bos_id] + encoded.ids + [eos_id]
-            buffer.extend(story_tokens)
 
-            # Create chunks from the buffer
-            while len(buffer) >= sequence_length:
-                chunk = buffer[:sequence_length]
-                tokens.append(chunk)
-                buffer = buffer[stride:]
 
-            if len(tokens) * sequence_length >= max_tokens:
+# === 4. Tokenizer Preparation ===
+def setup_tokenizer(corpus_path, tokenizer_dir="tokenizer-tinystories", vocab_size=50257):
+    print("Tokenizer Setup")
+    vocab_path = os.path.join(tokenizer_dir, "vocab.json")
+    merges_path = os.path.join(tokenizer_dir, "merges.txt")
+    if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
+        print("[Tokenizer] Training new tokenizer...")
+        tokenizer = ByteLevelBPETokenizer()
+        tokenizer.train(
+            files=[corpus_path], vocab_size=vocab_size, min_frequency=2,
+            special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
+        )
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tokenizer.save_model(tokenizer_dir)
+    else:
+        print("[Tokenizer] Loading existing tokenizer...")
+        tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path)
+    tokenizer.add_special_tokens(["<pad>", "<unk>", "<bos>", "<eos>"])
+    pad_id = tokenizer.token_to_id("<pad>")
+    tokenizer.post_processor = BertProcessing(("<pad>", pad_id), ("<pad>", pad_id))
+    return tokenizer
+
+
+
+
+# === 5. Corpus Encoding ===
+def encode_corpus(corpus_path, tokenizer, sequence_length=256, max_tokens=10_000_000):
+    print("Encode Corpus")
+    tokens = []
+    buffer = []
+    stride = sequence_length // 3
+    bos_id = tokenizer.token_to_id("<bos>")
+    eos_id = tokenizer.token_to_id("<eos>")
+    max_stories = 500_000
+    story_count = 0
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            story_count += 1
+            if story_count >= max_stories:
                 break
-
-    # Handle leftover tokens (optional)
+            line = line.strip()
+            if line:
+                encoded = tokenizer.encode(line)
+                story_tokens = [bos_id] + encoded.ids + [eos_id]
+                buffer.extend(story_tokens)
+                while len(buffer) >= sequence_length:
+                    chunk = buffer[:sequence_length]
+                    tokens.append(chunk)
+                    buffer = buffer[stride:]
+                if len(tokens) * sequence_length >= max_tokens:
+                    break
     if len(buffer) >= sequence_length // 2:
         pad_id = tokenizer.token_to_id("<pad>")
         padded = buffer + [pad_id] * (sequence_length - len(buffer))
         tokens.append(padded[:sequence_length])
+    return tokens
 
-print("Build Tensor From Chunks")
-
-# Build tensor from pre-chunked list
-all_sequences = tokens  # list of variable-length sequences
-
-loader = DataLoader(all_sequences, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_dynamic)
-
-# Model & Hooks
-model = EnhancedResonantTransformer(
-    vocab_size=tokenizer.get_vocab_size(),
-    d_model=d_model,
-    num_heads=num_heads,
-    num_layers=num_layers,
-    resonant_token_count = resonant_token_count,
-    dynamic_resonant_token_count = dynamic_resonant_token_count,
-    multihead = multihead_resonance,
-    max_recursive_steps = max_recursive_steps
-).to(DEVICE)
-model.train()
-
-dynamic_attn_cap = max(10, int(0.5 * num_layers * num_heads))
-
-torch.autograd.set_detect_anomaly(True)
-
-scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
-
-print("Add Resonant Token Parameters")
-
-# — Prepare a precise set of only the resonant‑token params for inner updates —
-inner_res_params = set()
-if resonant_token_count > 0:
-    inner_res_params.add(model.resonant_tokens)
-if dynamic_resonant_token_count > 0:
-    inner_res_params.update(model.controller.parameters())
-if multihead_resonance:
-    inner_res_params.update(model.resonator.parameters())
-
-print("Add Attention Hooks")
-
-# Attention hook setup: register on custom encoder_layers
-attn_records = []
-def attn_hook(module, inp, output):
-    # output is (attn_output, attn_weights)
-    if isinstance(output, tuple) and output[1] is not None:
-        attn_records.append(output[1].detach())
-        # Dynamically cap attn_records
-        if len(attn_records) > dynamic_attn_cap:
-            del attn_records[0]
-
-if not baseline and lambda_attn != 0:
-    for layer in model.encoder_layers:
-        layer.register_forward_hook(attn_hook)
-avg_attn = None
-attn_momentum = 0.99
-
-# Optimizer & Criterion
-# opt = torch.optim.Adam(model.parameters(), lr=learning_rate)
-# in train.py, when you build the optimizer:
-if not baseline:
-    # During warmup, exclude resonant token params
-    opt = torch.optim.Adam([
-        {'params': [p for n, p in model.named_parameters()
-                    if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
-         'lr': learning_rate}
-    ])
-else:
-    opt = torch.optim.Adam([
-        # everything else
-        {'params': [p for n,p in model.named_parameters() if 'resonant_tokens' not in n
-                    and 'controller' not in n and 'resonator' not in n],
-        'lr': learning_rate,
-        'weight_decay': weight_decay}
-    ])
-    
-# Set up cosign annealing for the learning rate to help prevent overfitting
-from torch.optim.lr_scheduler import CosineAnnealingLR
-dataset_size = len(all_sequences)
-steps_per_epoch = dataset_size // batch_size
-total_training_steps = steps_per_epoch * num_epochs
-cosine_scheduler = CosineAnnealingLR(opt, T_max=total_training_steps, eta_min=1e-5)
-
-crit = nn.CrossEntropyLoss(ignore_index=pad_id)
-last_res=None
-
-sur_baseline = None
-res_baseline = None
-
-last_run_time = time.time()
-
-# Track entropy skip counts per epoch
-skip_counts = {
-    "entropy_loss": 0,
-    "surprisal_loss": 0,
-    "resolution_loss": 0
-}
-
-resonant_attention_scale = 1.0
-final_max_steps = model.max_recursive_steps
-# start at 2 resursive steps and ramp to the configured number
-model.max_recursive_steps = 2
-model.repair_counter = global_repair_counter
-
-# Training
-for epoch in range(num_epochs):
-
-    # === Check if we need to switch modes at start of epoch ===
-    if epoch == warmup_epochs and not baseline:
-        print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
-
-        # Enable grads for resonant-related parameters
-        for p in model.parameters():
-            p.requires_grad_(True)
-
-        # Rebuild optimizer including resonant tokens
-        param_groups = [
-            {
-                'params': [p for n, p in model.named_parameters()
-                           if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
-                'lr': learning_rate
-            }
-        ]
-        if resonant_token_count > 0:
-            param_groups.append({
-                'params': [model.resonant_tokens],
-                'lr': learning_rate * token_learning_amplifier
-            })
-        if dynamic_resonant_token_count > 0:
-            param_groups.append({
-                'params': model.controller.parameters(),
-                'lr': learning_rate * token_learning_amplifier
-            })
-        if multihead_resonance:
-            param_groups.append({
-                'params': model.resonator.parameters(),
-                'lr': learning_rate * token_learning_amplifier
-            })
-
-        opt = torch.optim.Adam(param_groups)
-
-        # === Boost resonant token attention incentive ===
-        # lambda_resonant_attention *= 2.0
-        resonant_attention_scale = 2.0
-
-        # === Force a refresh of _res_tokens_for_ri ===
-        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            with torch.no_grad():
-                model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
-
-        # === VERY IMPORTANT: clean resonant tokens ===
-        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            with torch.no_grad():
-                model._res_tokens_for_ri.clamp_(-1.0, 1.0)  # Limit to safe range
-                nan_mask = torch.isnan(model._res_tokens_for_ri)
-                model._res_tokens_for_ri[nan_mask] = 0.0  # replace any NaNs
-                model._res_tokens_for_ri.requires_grad_(True)
-
-    # If still in warmup, freeze resonant parameters
-    if epoch < warmup_epochs:
-        for p in inner_res_params:
-            p.requires_grad_(False)
-
-    # ramp max_recursive_steps over time
-    if hasattr(model, "max_recursive_steps") and epoch > warmup_epochs and model.max_recursive_steps < final_max_steps:
-        model.max_recursive_steps += 1
-
-
-    # Rebuild fresh references to resonant-token parameters
-    inner_res_params = set()
-    if resonant_token_count > 0:
-        inner_res_params.add(model.resonant_tokens)
-    if dynamic_resonant_token_count > 0:
-        inner_res_params.update(model.controller.parameters())
-    if multihead_resonance:
-        inner_res_params.update(model.resonator.parameters())
-
-    model.alpha = cosine_rampup(epoch, warmup_epochs)
-    for bidx, (batch, lengths) in enumerate(loader):
-        model.excess_flux_count = 0
-
-        inp = batch[:, :-1]
-        inp = inp.to(DEVICE)
-        tgt = batch[:, 1:]
-        tgt = tgt.to(DEVICE)
-        ctx = last_res if last_res is not None else inp
-
+# === 6. DataLoader Creation ===
+def create_dataloader(all_sequences, tokenizer, batch_size=32):
+    def collate_dynamic(batch):
+        lengths = [len(x) for x in batch]
+        max_len = max(lengths)
         pad_id = tokenizer.token_to_id("<pad>")
-        padding_mask = (inp == pad_id)
+        padded = [x + [pad_id] * (max_len - len(x)) for x in batch]
+        return torch.tensor(padded, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
+    print("Build Tensor From Chunks")
+    loader = DataLoader(
+        all_sequences, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_dynamic
+    )
+    return loader
 
-        ctx = ctx.to(DEVICE)
-        padding_mask = padding_mask.to(DEVICE)
 
+
+
+# === 7. Model Building ===
+def build_model(config, tokenizer, device):
+    print("Build Model")
+    model = EnhancedResonantTransformer(
+        baseline=config["baseline"],
+        vocab_size=tokenizer.get_vocab_size(),
+        d_model=config["d_model"],
+        num_heads=config["num_heads"],
+        num_layers=config["num_layers"],
+        resonant_token_count=config["resonant_token_count"],
+        dynamic_resonant_token_count=config["dynamic_resonant_token_count"],
+        multihead=config["multihead_resonance"],
+        max_recursive_steps=config["max_recursive_steps"]
+    ).to(device)
+    model.train()
+    torch.autograd.set_detect_anomaly(True)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+    attn_records = []
+
+    attn_momentum = 0.99
+    def attn_hook(module, inp, output):
+        if isinstance(output, tuple) and output[1] is not None:
+            attn_out = output[1].detach()
+            if not hasattr(model, "avg_attn"):
+                model.avg_attn = attn_out.mean(0)
+            else:
+                model.avg_attn = attn_momentum * model.avg_attn + (1 - attn_momentum) * attn_out.mean(0)
+            attn_records.append(attn_out)
+            if len(attn_records) > max(10, int(0.5 * config["num_layers"] * config["num_heads"])):
+                del attn_records[0]
+
+    if not config["baseline"] and config["lambda_attn"] != 0:
+        for layer in model.encoder_layers:
+            layer.register_forward_hook(attn_hook)
+
+    return model, scaler, attn_records
+
+# === 8. Optimizer and Scheduler Setup ===
+def setup_optimizer_and_scheduler(model, config, dataset_size, device_type="cuda"):
+    print("Setup Optimizer and Scheduler")
+    learning_rate = config["learning_rate"]
+    weight_decay = config["weight_decay"]
+    batch_size = config["batch_size"]
+    num_epochs = config["num_epochs"]
+    baseline = config["baseline"]
+
+    if not baseline:
+        optimizer = torch.optim.Adam([
+            {'params': [p for n, p in model.named_parameters()
+                        if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+             'lr': learning_rate}
+        ])
+    else:
+        optimizer = torch.optim.Adam([
+            {'params': [p for n, p in model.named_parameters()
+                        if 'resonant_tokens' not in n and 'controller' not in n and 'resonator' not in n],
+             'lr': learning_rate, 'weight_decay': weight_decay}
+        ])
+
+    steps_per_epoch = dataset_size // batch_size
+    total_training_steps = steps_per_epoch * num_epochs
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_training_steps, eta_min=1e-5
+    )
+
+    return optimizer, scheduler
+
+
+
+
+# === 9. Loss and Logging Helpers ===
+def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
+                   skip_counts, attn_records, sur_baseline, res_baseline,
+                   hidden_contrastive_loss, flux_penalty):
+    crit = torch.nn.CrossEntropyLoss(ignore_index=model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else 0)
+    primary = crit(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
+
+    con = penalty = sur_reward = akl = res_reward = dvt = torch.tensor(0.0, device=device)
+
+    if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
+        dvt = diversity_penalty(model._res_tokens_for_ri)
+
+    if not config["baseline"]:
+        # === Create dummy dependency for resonant tokens ===
         if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            if torch.isnan(model._res_tokens_for_ri).any():
-                print("[train.py] WARNING: NaNs detected in model._res_tokens_for_ri! Repairing...")
-                with torch.no_grad():
-                    model._res_tokens_for_ri.data = torch.nan_to_num(model._res_tokens_for_ri.data, nan=0.0, posinf=1.0, neginf=-1.0)
-            # Soft project to maintain healthy norms
-            with torch.no_grad():
-                model._res_tokens_for_ri.data = hard_project_onto_hypersphere(
-                    model._res_tokens_for_ri.data,
-                    radius=1.0
-                )
+            primary = primary + 0.0 * model._res_tokens_for_ri.sum()
 
-        with autocast(device_type=DEVICE.type, enabled=(DEVICE.type in ["cuda", "mps"])):  # <-- ADDED
-            if not baseline:
+        lp = F.log_softmax(logits, dim=-1)
+        tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+        spr = -tlp
+        dr = spr[:, :-1] - spr[:, 1:]
+        sur = F.relu(dr).mean() / inp.size(1)
 
-                # === fade_in_strength smoothly rises from 0 to 1 after warmup ===
-                if epoch >= warmup_epochs:
-                    fade_in_strength = (epoch - warmup_epochs + bidx / len(loader)) / 5.0  # spread over 5 epochs
-                    fade_in_strength = min(1.0, max(0.0, fade_in_strength))
-                else:
-                    fade_in_strength = 0.0
+        if torch.isnan(sur) or torch.isinf(sur):
+            sur = torch.tensor(0.0, device=device)
+            skip_counts["surprisal_loss"] += 1
 
-                logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
-                    inp, ctx,
-                    tol=recursive_convergence_tolerance,
-                    padding_mask=padding_mask,
-                    fade_in_strength=fade_in_strength
-                )
-
-                # Immediately repair resonant tokens if needed
-                if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                    with torch.no_grad():
-                        mask = torch.isnan(model._res_tokens_for_ri)
-                        if mask.any():
-                            print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
-                            model._res_tokens_for_ri.data[mask] = 0.0
-
-                # Immediately repair recursive output (res) if needed
-                if res is not None:
-                    with torch.no_grad():
-                        mask = torch.isnan(res)
-                        if mask.any():
-                            print("[repair] NaNs detected in recursive output (res). Clamping...")
-                            res.data[mask] = 0.0
-
-                # Conditionally clamp res only if needed
-                if res.abs().max() > 10.0:
-                    print("[stabilize] Large values detected in res. Clamping to [-10, 10].")
-                    res = torch.clamp(res, min=-10.0, max=10.0)
-
-
-                # === Fix flux_penalty to safe float32 outside autocast ===
-                flux_penalty = flux_penalty.to(torch.float32)
-            else:
-                logits, res, _, _, _ = model.forward(inp, ctx, padding_mask=padding_mask)
-            steps = getattr(model, "last_recursive_steps", 0)
-            logits = logits[:,:inp.size(1)]
-            if logits.abs().max() > 10.0:
-                print("[logits_stabilize] Warning: clamping logits to [-10, 10].")
-                logits = torch.clamp(logits, min=-10.0, max=10.0)
-            primary = crit(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
-
-            # Create dummy connection between primary and _res_tokens_for_ri
-            if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                primary = primary + 0.0 * model._res_tokens_for_ri.sum()
-
-        # — Surprisal‑drop reward (normalized, clipped, baselined) —
-        if not baseline:
-            lp  = F.log_softmax(logits, dim=-1)
-            tlp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-            spr = -tlp
-            dr = spr[:, :-1] - spr[:, 1:]
-            sur = F.relu(dr).mean() / inp.size(1)
-            # Guard against NaNs/Infs during surprisal computation
-            if torch.isnan(sur) or torch.isinf(sur):
-                print("[entropy_surprisal] Warning: skipping surprisal loss due to invalid values.")
-                sur = torch.tensor(0.0, device=DEVICE)
-                skip_counts["surprisal_loss"] += 1
-            sur = torch.clamp(sur, max=0.5)             # clip to [0, 0.5]
-
-            # update running baseline
-            if sur_baseline is None:
-                sur_baseline = sur.detach()
-            else:
-                sur_baseline = 0.99 * sur_baseline + 0.01 * sur.detach()
-
-            sur_reward = sur - sur_baseline             # only above‐baseline counts
-            primary   = primary - lambda_sur * sur_reward
+        sur = torch.clamp(sur, max=0.5)
+        if sur_baseline is None:
+            sur_baseline = sur.detach()
         else:
-            sur_reward = torch.tensor(0.0, device=DEVICE)
+            sur_baseline = 0.99 * sur_baseline + 0.01 * sur.detach()
 
-        # — Attention‑KL reward (capped) —
-        if not baseline and attn_records:
+        sur_reward = sur - sur_baseline
+        primary = primary - config["lambda_sur"] * sur_reward
+
+        if attn_records and hasattr(model, "avg_attn"):
             ca = torch.stack(attn_records).mean(0)
-            avg_attn = ca.mean(0) if avg_attn is None else (
-                        attn_momentum * avg_attn + (1-attn_momentum) * ca.mean(0)
-                    )
-            cur, avg = ca.mean(0) + 1e-8, avg_attn + 1e-8
+            cur, avg = ca.mean(0) + 1e-8, model.avg_attn + 1e-8
             akl = F.kl_div(cur.log(), avg, reduction='batchmean')
-            akl = torch.clamp(akl, max=0.1)             # cap at 0.1 nats
-            primary = primary - lambda_attn * akl   # modestly upweight if desired
+            akl = torch.clamp(akl, max=0.1)
+            primary = primary - config["lambda_attn"] * akl
+            model.avg_attn = avg
             del attn_records[:]
-        else:
-            akl = torch.tensor(0.0, device=DEVICE)
 
-        # — Resolution‑coherence reward (clipped, baselined) —
-        if not baseline and logits.size(1) >= 2:
-            pr = lp.exp()
-            pr = pr.clamp(min=1e-5, max=1.0-1e-5)  # New
-            lp = torch.log(pr)                      # New
-            if torch.isnan(pr).any() or torch.isinf(pr).any() or torch.isnan(lp).any() or torch.isinf(lp).any():
-                print("[entropy_resolution] Warning: skipping resolution loss due to invalid values.")
-                ent = torch.zeros_like(lp.sum(-1))
-                skip_counts["resolution_loss"] += 1
-            else:
-                ent = -(pr * lp).sum(-1)
+        if logits.size(1) >= 2:
+            pr = lp.exp().clamp(min=1e-5, max=1-1e-5)
+            ent = -(pr * pr.log()).sum(-1)
             pen, pos = ent[:, -2], ent[:, -1]
             rr = F.relu(pen - pos).mean()
             rr = torch.clamp(rr, max=0.5)
 
-            # update running baseline
             if res_baseline is None:
                 res_baseline = rr.detach()
             else:
                 res_baseline = 0.99 * res_baseline + 0.01 * rr.detach()
 
             res_reward = rr - res_baseline
-            primary    = primary - lambda_res * res_reward
-        else:
-            res_reward = torch.tensor(0.0, device=DEVICE)
+            primary = primary - config["lambda_res"] * res_reward
 
-        # — Contrastive term unchanged —
-        if not baseline:
-            ci = inp.clone()
-            ci[:, -1] = torch.randint(0, tokenizer.get_vocab_size(), (batch_size,), device=DEVICE)
-            # compute contrastive logits separately, no autograd tracking
-            with torch.no_grad():
-                contrast_logits, _, _, _ = model.recursive_forward(ci, ci, tol=recursive_convergence_tolerance)
-                contrastive_loss_val = contrastive_loss(logits, contrast_logits)
-
-                # === Rescue if contrastive loss collapses ===
-                min_contrastive_loss = 1e-4
-                if contrastive_loss_val.item() < min_contrastive_loss:
-                    rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0  # adjustable
-                    contrastive_loss_val = contrastive_loss_val + rescue_boost
-                    # print(f"[contrastive_loss_rescue] Boosted contrastive loss by {rescue_boost:.6f}")
-                con = contrastive_loss_val
-        else:
-            con = torch.tensor(0.0, device=DEVICE)
-
-        # — New: Resonant token attention reward —
-        if not baseline and attn_records:
-            avg_attn_map = torch.stack(attn_records).mean(0)  # [batch, seq, seq]
-            num_resonant_tokens = getattr(model, '_res_tokens_for_ri', torch.empty(0)).size(1)
-            if num_resonant_tokens > 0 and avg_attn_map.size(-1) >= num_resonant_tokens:
-                # Only consider attention towards resonant token positions
-                attn_bonus = avg_attn_map[:, :, :num_resonant_tokens].sum(dim=-1).mean()
-                resonant_attention_reward = (attn_bonus ** 2).mean()  # stronger quadratic scaling
-                primary = primary - (lambda_resonant_attention * resonant_attention_scale) * resonant_attention_reward
-            else:
-                attn_bonus = torch.tensor(0.0, device=DEVICE)
-        else:
-            attn_bonus = torch.tensor(0.0, device=DEVICE)
-
-        # — Entropy bonus (discourage low‑entropy repetition) —
-        if not baseline:
-            # log‑probabilities over the full vocab
-            lp_ent = F.log_softmax(logits, dim=-1)      # shape [B, L, V]
-            pr_ent = lp_ent.exp()                       # shape [B, L, V]
-            # entropy per token = −∑ p log p; then mean over batch & sequence
-            # Safer entropy loss computation
-            # Clamp pr_ent to avoid degenerate zeros/ones
-            pr_ent = pr_ent.clamp(min=1e-5, max=1.0-1e-5)
-            lp_ent = torch.log(pr_ent)
-            # Check for any NaNs or Infs after clamping (ultra safe)
-            if torch.isnan(pr_ent).any() or torch.isinf(pr_ent).any() or torch.isnan(lp_ent).any() or torch.isinf(lp_ent).any():
-                print("[entropy_loss] Warning: skipping entropy loss due to invalid values.")
-                ent_loss = torch.tensor(0.0, device=pr_ent.device)
-                skip_counts["entropy_loss"] += 1
-            else:
-                ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
-            # small weight to reward higher entropy
-            primary = primary - 1e-4 * ent_loss
-
-        # first build the final loss including these terms
-
-        penalty = torch.tensor(0.0, device=DEVICE)  # Safe default penalty
-        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
-            grad_tuple = torch.autograd.grad(
-                primary, model._res_tokens_for_ri,
-                retain_graph=True,
-                create_graph=True,
-                allow_unused=True
-            )
-            gr = grad_tuple[0]
-            if gr is not None:
-                gn = gr.norm(dim=-1).clamp(min=1e-6)  # prevent div-by-zero
-                diversity_weight = min(lambda_div * (epoch / num_epochs), lambda_div)
-                penalty = (
-                    lambda_ri * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
-                    + lambda_rs * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-                    + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
-                )
-        
-        self_model_loss_weight = 0.1
-        if hasattr(model, 'last_self_model_loss'):
-            term3 = model.last_self_model_loss * self_model_loss_weight
-        
-        # adjust loss for flux (cognitive fatigue)
-        if not baseline:
-            term4 = flux_penalty_weight * flux_penalty
-
-        if hasattr(model, "dynamic_tokens_latest") and model.dynamic_tokens_latest is not None and model.dynamic_tokens_latest.numel() > 0:
-            dynamic_variance = model.dynamic_tokens_latest.var(dim=-1).mean()
-            resonant_usage_penalty = F.relu(0.05 - dynamic_variance)  # encourage at least variance ~0.05
-            primary = primary + 0.1 * resonant_usage_penalty
-
-        if hasattr(model, "latest_context_flux") and model.latest_context_flux is not None:
-            context_flux_bonus = model.latest_context_flux
-            primary = primary - 0.05 * context_flux_bonus
-
-        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            model._res_tokens_for_ri.grad = None
-
-        
-        final = (primary - penalty + term3 + term4 + 0.05 * hidden_contrastive_loss) + con if not baseline else primary
-
-        # === ADDITION: small constant diversity encouragement every batch ===
-        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-            batch_div_loss = 0.001 * diversity_penalty(model._res_tokens_for_ri)
-            final = final + batch_div_loss
-        else:
-            batch_div_loss = torch.tensor(0.0, device=DEVICE)
-
-        # Backprop the full loss
-        opt.zero_grad()
-        final.backward()
-
-        val_ri = 0.0
-        val_rs = 0.0
-        val_cos_sim = 0.0
-        res_token_norm = 0.0
-        stat_norm = 0.0
-        dyn_norm = 0.0
-        mh_norm = 0.0
-        dvt = torch.tensor(0.0, device=DEVICE)
-
-        if not baseline and hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None and model._res_tokens_for_ri.numel() > 0:
-            if model._res_tokens_for_ri.grad is not None:
-                gr = model._res_tokens_for_ri.grad  # (B, T, D)
-                ri_v = (gr * model._res_tokens_for_ri).sum(dim=-1).abs()
-                rs_v = 1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-                cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-                val_ri = ri_v.mean().item()
-                val_rs = rs_v.mean().item()
-                val_cos_sim = cos_sim_v.mean().item()
-            res_token_norm = model._res_tokens_for_ri.norm().item()
-            if hasattr(model, 'resonant_tokens'):
-                stat_norm = model.resonant_tokens.norm().item()
-            dvt = diversity_penalty(model._res_tokens_for_ri)
-
-            
-            cos_sim_v = F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)
-            val_cos_sim = cos_sim_v.mean().item()
-
-        
-        other_params = [p for n,p in model.named_parameters()
-                        if 'resonant_tokens' not in n
-                        and 'controller' not in n
-                        and 'resonator' not in n]
-        torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
-
-        opt.step()
-        if epoch >= warmup_epochs:  # Only run cosine after warmup
-            cosine_scheduler.step()
-        del attn_records[:]
-
-        # Clamp resonant token norms post-update to prevent explosion
+        ci = inp.clone()
+        ci[:, -1] = torch.randint(0, logits.size(-1), (inp.size(0),), device=device)
         with torch.no_grad():
-            if hasattr(model, 'resonant_tokens'):
-                norm = model.resonant_tokens.norm(dim=-1, keepdim=True).clamp(min=1.0, max=10.0)
-                model.resonant_tokens.copy_(model.resonant_tokens / norm)
+            contrast_logits, _, _, _ = model.recursive_forward(ci, ci, tol=config["recursive_convergence_tolerance"])
+            contrastive_loss_val = contrastive_loss(logits, contrast_logits)
+            min_contrastive_loss = 1e-4
+            if contrastive_loss_val.item() < min_contrastive_loss:
+                rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0
+                contrastive_loss_val = contrastive_loss_val + rescue_boost
+            con = contrastive_loss_val
 
-        # every 100 batches, give tokens 5 exclusive mini‑steps:
-        if epoch >= warmup_epochs and bidx % 100 == 0 and (resonant_token_count + dynamic_resonant_token_count) > 0:
-            # 1) freeze all except the exact inner_res_params
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in inner_res_params:
-                p.requires_grad = True
+        lp_ent = F.log_softmax(logits, dim=-1)
+        pr_ent = lp_ent.exp().clamp(min=1e-5, max=1-1e-5)
+        lp_ent = torch.log(pr_ent)
+        ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
+        primary = primary - 1e-4 * ent_loss
 
-            # 2) inner token‑only loop
-            for _ in range(5):
-                # Forward pass
-                logits, res, flux_penalty, _ = model.recursive_forward(inp, tol=recursive_convergence_tolerance)
+        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            gr_tuple = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=True, allow_unused=True)
+            gr = gr_tuple[0]
+            if gr is not None:
+                gn = gr.norm(dim=-1).clamp(min=1e-6)
+                penalty = (
+                    config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean() / gn.mean()
+                    + config["lambda_rs"] * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
+                    + config["lambda_div"] * diversity_penalty(model._res_tokens_for_ri)
+                )
 
-                # Immediately repair resonant tokens if needed
+        primary = primary - penalty
+        primary = primary + 0.05 * hidden_contrastive_loss
+        primary = primary + config["flux_penalty_weight"] * flux_penalty
+
+    return primary, con, penalty, sur_reward, akl, res_reward, sur_baseline, res_baseline
+
+
+
+
+# === 10. Logging ===
+def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoch, batch_idx, loader_len, config, skip_counts, global_repair_counter):
+    import numpy as np
+    now = time.time()
+    if not hasattr(log_metrics, "_last_log_time"):
+        log_metrics._last_log_time = now
+    delta_s = now - log_metrics._last_log_time
+    log_metrics._last_log_time = now
+
+    global_step = epoch * loader_len + batch_idx
+    ppl = float(np.exp(primary.item())) if primary.item() < 100 else float('inf')
+
+    res_token_norm = 0.0
+    stat_norm = 0.0
+    dyn_norm = 0.0
+    mh_norm = 0.0
+    excess_flux_count = getattr(model, "excess_flux_count", 0)
+    loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
+    vector_repairs = sum(global_repair_counter.values())
+    self_attn_mean = model.attention_trajectory[-1] if hasattr(model, "attention_trajectory") and model.attention_trajectory else 0.0
+    recursive_steps = getattr(model, "last_recursive_steps", 0)
+    last_flux_cost = getattr(model, "last_flux_cost", 0.0)
+    flux_budget = getattr(model, "flux_budget", 0.0)
+
+
+    if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+        res_token_norm = model._res_tokens_for_ri.norm().item()
+    if hasattr(model, 'resonant_tokens') and model.resonant_tokens is not None:
+        stat_norm = model.resonant_tokens.norm().item()
+
+    ctx_vec = None
+    if ctx is not None:
+        if ctx.dtype in (torch.int32, torch.int64):
+            if hasattr(model, 'embedding'):
+                ctx_emb = model.embedding(ctx)
+                ctx_vec = ctx_emb.mean(dim=1)
+        else:
+            ctx_vec = ctx.mean(dim=1)
+
+    if ctx_vec is not None:
+        if hasattr(model, 'controller') and model.controller is not None:
+            dyn_norm = model.controller(ctx_vec).norm().item()
+        if hasattr(model, 'resonator') and model.resonator is not None:
+            mh_norm = model.resonator(ctx_vec).norm().item()
+
+
+    wandb.log({
+        'loss': primary.item(),
+        'perplexity': ppl,
+        'surprisal_reward': sur_reward.item() if sur_reward is not None else 0.0,
+        'attention_kl': akl.item() if akl is not None else 0.0,
+        'resolution_score': res_reward.item() if res_reward is not None else 0.0,
+        'res_token_norm': res_token_norm,
+        'static_res_norm': stat_norm,
+        'dynamic_res_norm': dyn_norm,
+        'multihead_res_norm': mh_norm,
+        'contrastive_loss': con.item(),
+        'diversity_penalty': dvt.item(),
+        'excess_flux_count': excess_flux_count,
+        'entropy_loss_skips': skip_counts["entropy_loss"],
+        'surprisal_loss_skips': skip_counts["surprisal_loss"],
+        'resolution_loss_skips': skip_counts["resolution_loss"],
+        'repairs_logits': global_repair_counter["logits"],
+        'repairs_resonant_output': global_repair_counter["resonant output"],
+        'repairs_hidden_state': global_repair_counter["hidden state"],
+        'repairs_context_vector': global_repair_counter["context vector"],
+
+        'self_attn_mean': self_attn_mean,
+        'recursive_steps': recursive_steps,
+        'last_flux_cost': last_flux_cost,
+        'flux_budget': flux_budget,
+    }, step=global_step)
+
+    print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {batch_idx} - PPL: {ppl:.2f} | NORM: {res_token_norm:.2f} | "
+          f"SUR: {sur_reward.item() if sur_reward is not None else 0.0:.4f} | AKL: {akl.item() if akl is not None else 0.0:.4f} | "
+          f"RES: {res_reward.item() if res_reward is not None else 0.0:.4f} | "
+          f"RI: 0.0 | RSC: 0.0 | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | REPAIRS: {vector_repairs}")
+
+
+
+
+# === 11. Training Loop ===
+def train(model, loader, opt, scheduler, config, device, tokenizer):
+    print("Start Training")
+    last_res = None
+    sur_baseline = None
+    res_baseline = None
+    global_repair_counter = {"logits": 0, "resonant output": 0, "hidden state": 0, "context vector": 0}
+    skip_counts = {"entropy_loss": 0, "surprisal_loss": 0, "resolution_loss": 0}
+    attn_records = []
+    for epoch in range(config["num_epochs"]):
+        last_res, sur_baseline, res_baseline = train_epoch(
+            model, loader, opt, scheduler, config, device, epoch,
+            last_res, sur_baseline, res_baseline,
+            global_repair_counter, skip_counts, attn_records,
+            tokenizer
+        )
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(model, opt, config, epoch)
+    save_final_model(model, config, last_res)
+
+
+def train_epoch(model, loader, opt, scheduler, config, device, 
+                epoch, last_res, sur_baseline, res_baseline, 
+                global_repair_counter, skip_counts, attn_records, 
+                tokenizer):
+    
+    print(f"Start Epoch {epoch+1}/{config['num_epochs']}")
+    model.train()
+    model.alpha = cosine_rampup(epoch, config["warmup_epochs"])
+    
+    if epoch >= config["warmup_epochs"] and hasattr(model, "max_recursive_steps") and model.max_recursive_steps < config["max_recursive_steps"]:
+        model.max_recursive_steps += 1
+
+    if epoch == config["warmup_epochs"] and hasattr(model, 'resonant_attention_scale'):
+        model.resonant_attention_scale *= 2
+    
+    if epoch == config["warmup_epochs"]:
+        print(f"=== Warmup complete at epoch {epoch}: enabling resonant parameters and rebuilding optimizer ===")
+        
+        # Enable grads for resonant-related parameters
+        for name, param in model.named_parameters():
+            param.requires_grad_(True)
+
+        # Rebuild optimizer with resonant token params at boosted LR
+        param_groups = [
+            {
+                'params': [p for n, p in model.named_parameters()
+                           if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
+                'lr': config["learning_rate"]
+            }
+        ]
+        if config["resonant_token_count"] > 0:
+            param_groups.append({
+                'params': [model.resonant_tokens],
+                'lr': config["learning_rate"] * config["token_learning_amplifier"]
+            })
+        if config["dynamic_resonant_token_count"] > 0:
+            param_groups.append({
+                'params': model.controller.parameters(),
+                'lr': config["learning_rate"] * config["token_learning_amplifier"]
+            })
+        if config["multihead_resonance"]:
+            param_groups.append({
+                'params': model.resonator.parameters(),
+                'lr': config["learning_rate"] * config["token_learning_amplifier"]
+            })
+
+        opt.param_groups.clear()
+        opt.add_param_group(param_groups[0])
+        if len(param_groups) > 1:
+            for group in param_groups[1:]:
+                opt.add_param_group(group)
+
+        if hasattr(model, 'resonant_attention_scale'):
+            model.resonant_attention_scale *= 2
+
+        # Clamp resonant tokens cleanly after enabling
+        if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+            with torch.no_grad():
+                model._res_tokens_for_ri.clamp_(-1.0, 1.0)
+                model._res_tokens_for_ri.requires_grad_(True)
+
+    for batch_idx, (batch, lengths) in enumerate(loader):
+        last_res, sur_baseline, res_baseline = train_batch(
+            model, batch, lengths, opt, scheduler, config, device, epoch, batch_idx,
+            last_res, sur_baseline, res_baseline,
+            global_repair_counter, skip_counts, attn_records,
+            loader_len=len(loader),
+            tokenizer=tokenizer
+        )
+    return last_res, sur_baseline, res_baseline
+
+
+
+def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, batch_idx,
+                last_res, sur_baseline, res_baseline, global_repair_counter, skip_counts,
+                attn_records, loader_len, tokenizer):
+
+    model.excess_flux_count = 0
+
+    inp = batch[:, :-1].to(device)
+    tgt = batch[:, 1:].to(device)
+
+    ctx = last_res if last_res is not None else inp
+    padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
+
+    # === Calculate smooth fade_in_strength for recursive steps ===
+    if epoch < config["warmup_epochs"]:
+        # During warmup: use global cosine rampup
+        fade_in_strength = cosine_rampup(epoch + batch_idx / len(loader), config["warmup_epochs"])
+    else:
+        # After warmup: each extra step gets smooth fade
+        base_steps = 2  # how many steps were present at warmup
+        added_steps = model.max_recursive_steps - base_steps
+        if added_steps <= 0:
+            fade_in_strength = 1.0
+        else:
+            # How much time has passed since warmup (in epochs)
+            epochs_since_warmup = (epoch - config["warmup_epochs"]) + (batch_idx / len(loader))
+            total_fade_time = added_steps * 5.0  # each step gets 5 epochs to fade
+            fade_in_strength = min(1.0, max(0.0, epochs_since_warmup / total_fade_time))
+
+    logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
+        inp, ctx,
+        tol=config["recursive_convergence_tolerance"],
+        padding_mask=padding_mask,
+        fade_in_strength=fade_in_strength
+    )
+
+    if batch_idx % 10 == 0:
+        global_step = epoch * len(loader) + batch_idx
+        wandb.log({
+            'fade_in_strength': fade_in_strength,
+        }, step=global_step)
+
+    # Immediately after logits are produced: clamp large values
+    if logits.abs().max() > 10.0:
+        print("[logits_stabilize] Warning: clamping logits to [-10, 10].")
+        logits = torch.clamp(logits, min=-10.0, max=10.0)
+
+    # === Immediately after forward pass, repair resonant tokens ===
+    if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
+        with torch.no_grad():
+            # Repair any NaNs
+            mask = torch.isnan(model._res_tokens_for_ri)
+            if mask.any():
+                print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
+                model._res_tokens_for_ri.data[mask] = 0.0
+
+            # Soft project onto hypersphere
+            model._res_tokens_for_ri.data = hard_project_onto_hypersphere(
+                model._res_tokens_for_ri.data,
+                radius=1.0
+            )
+
+    if res is not None:
+        with torch.no_grad():
+            # Repair NaNs in recursive output
+            mask = torch.isnan(res)
+            if mask.any():
+                print("[repair] NaNs detected in recursive output. Clamping...")
+                res.data[mask] = 0.0
+
+            # Clamp large values
+            if res.abs().max() > 10.0:
+                print("[stabilize] Large values detected in recursive output. Clamping to [-10,10].")
+                res.clamp_(min=-10.0, max=10.0)
+
+    # strip off resonant tokens
+    logits = logits[:, :inp.size(1)]
+
+    primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline = compute_losses(
+        model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
+        skip_counts, attn_records, sur_baseline, res_baseline,
+        hidden_contrastive_loss, flux_penalty
+    )
+
+    opt.zero_grad()
+    primary.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    opt.step()
+
+    if batch_idx % 10 == 0:
+        log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, 
+                    ctx, epoch, batch_idx, loader_len, config, skip_counts, 
+                    global_repair_counter)
+
+    if scheduler is not None:
+        scheduler.step()
+
+    last_res = res
+
+    # === Every 100 batches: extra inner loop for resonant tokens ===
+    if epoch >= config["warmup_epochs"] and batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
+        print("[inner-loop] Resonant token refinement...")
+
+        # Freeze everything
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        # Unfreeze resonant token parts
+        inner_res_params = []
+        if hasattr(model, 'resonant_tokens'):
+            inner_res_params.append(model.resonant_tokens)
+        if hasattr(model, 'controller'):
+            inner_res_params.extend(model.controller.parameters())
+        if hasattr(model, 'resonator'):
+            inner_res_params.extend(model.resonator.parameters())
+        for p in inner_res_params:
+            p.requires_grad_(True)
+
+        for _ in range(5):
+            logits_inner, res_inner, _, _ = model.recursive_forward(
+                inp, ctx, tol=config["recursive_convergence_tolerance"], padding_mask=padding_mask
+            )
+
+            if logits_inner is not None:
+                logits_inner = logits_inner[:, :inp.size(1)]
+
+                crit = torch.nn.CrossEntropyLoss(ignore_index=model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else 0)
+                primary_inner = crit(logits_inner.reshape(-1, logits_inner.size(-1)), tgt.reshape(-1))
+
+                # Compute RI/RS/diversity on resonant tokens
+                token_loss = torch.tensor(0.0, device=device)
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                    with torch.no_grad():
-                        mask = torch.isnan(model._res_tokens_for_ri)
-                        if mask.any():
-                            print("[repair] NaNs detected in resonant tokens after forward pass. Clamping...")
-                            model._res_tokens_for_ri.data[mask] = 0.0
+                    grad_tuple = torch.autograd.grad(primary_inner, model._res_tokens_for_ri, retain_graph=False, create_graph=False, allow_unused=True)
+                    gr_inner = grad_tuple[0]
+                    if gr_inner is None:
+                        gr_inner = torch.zeros_like(model._res_tokens_for_ri)
+                    ri_v_inner = (gr_inner * model._res_tokens_for_ri).sum(dim=-1).abs()
+                    rs_v_inner = 1 - F.cosine_similarity(gr_inner, model._res_tokens_for_ri, dim=-1)
+                    dvt_inner = diversity_penalty(model._res_tokens_for_ri)
+                    token_loss = (
+                        config["lambda_ri"] * ri_v_inner.mean() +
+                        config["lambda_rs"] * rs_v_inner.mean() +
+                        config["lambda_div"] * dvt_inner
+                    )
 
-                # Immediately repair recursive output (res) if needed
-                if res is not None:
-                    with torch.no_grad():
-                        mask = torch.isnan(res)
-                        if mask.any():
-                            print("[repair] NaNs detected in recursive output (res). Clamping...")
-                            res.data[mask] = 0.0
-
-                # Conditionally clamp res only if needed
-                if res.abs().max() > 10.0:
-                    print("[stabilize] Large values detected in res. Clamping to [-10, 10].")
-                    res = torch.clamp(res, min=-10.0, max=10.0)
-
-                logits = logits[:, :inp.size(1), :]
-                
-                primary_inner = crit(
-                    logits.reshape(-1, logits.size(-1)),
-                    tgt.reshape(-1)
-                )
-
-                # compute the gradient of that primary w.r.t. the resonant tokens
-                grad_tuple = torch.autograd.grad(
-                    primary_inner,
-                    model._res_tokens_for_ri,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True
-                )
-                gr_inner = grad_tuple[0]
-                if gr_inner is None:
-                    gr_inner = torch.zeros_like(model._res_tokens_for_ri)
-
-                # Build RI/RS/Diversity terms
-                ri_v_inner = (gr_inner * model._res_tokens_for_ri).sum(dim=-1).abs()
-                term1 = lambda_ri * ri_v_inner.mean()
-                rs_v_inner = 1 - F.cosine_similarity(gr_inner, model._res_tokens_for_ri, dim=-1)
-                term2 = lambda_rs * rs_v_inner.mean()
-                dvt = lambda_div * diversity_penalty(model._res_tokens_for_ri)
-
-                token_loss = term1 + term2 + dvt
-
-                # Backward the token loss
                 opt.zero_grad()
                 token_loss.backward()
                 opt.step()
 
-                # === Refresh resonant token grads AFTER backward and step ===
+                # Clamp resonant tokens again after update
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
                     with torch.no_grad():
-                        model._res_tokens_for_ri.clamp_(-5.0, 5.0)  # Prevent runaway magnitudes
-                        model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
+                        model._res_tokens_for_ri.clamp_(-5.0, 5.0)
+                        model._res_tokens_for_ri.requires_grad_(True)
 
-            # === After all mini-steps, refresh _res_tokens_for_ri AGAIN ===
-            if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                with torch.no_grad():
-                    model._res_tokens_for_ri = model._res_tokens_for_ri.detach().clone().requires_grad_(True)
+        # Unfreeze all parameters again
+        for p in model.parameters():
+            p.requires_grad_(True)
 
-            # 3) unfreeze everything
-            for p in model.parameters():
-                p.requires_grad_(True)
+    return last_res, sur_baseline, res_baseline
 
 
-        # update
-        last_res = getattr(model,'_res_tokens_for_ri',None)
-        if last_res is not None: last_res=last_res.detach()
-        # log
-        if bidx%10==0:
-            global_step = epoch * len(loader) + bidx
-
-            resolution_score = 0.0
-            self_attn_mean = 0.0
-
-            # --- Diagnostic logging ---
-            if hasattr(model, 'resolution_score') and model.resolution_score is not None:
-                resolution_score = model.resolution_score
-
-            if hasattr(model, 'attention_trajectory') and model.attention_trajectory:
-                # attention_trajectory now holds scalar mean-attention values
-                self_attn_mean = model.attention_trajectory[-1]
 
 
-            if not baseline:
-                if last_res is not None:
-                    ctx_emb = model.embedding(last_res) if last_res.dtype in (torch.int64, torch.int32) else last_res
-                    context_vec = ctx_emb.mean(dim=1)
-                elif model.global_res is not None:
-                    context_vec = model.global_res.mean(dim=1).expand(batch_size, -1).contiguous()
-                else:
-                    context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
-            else:
-                context_vec = model.self_token.expand(batch_size, -1, -1).mean(dim=1)
 
-            if hasattr(model, 'controller'):
-                dyn_norm = model.controller(context_vec).norm().item()
-            if hasattr(model, 'resonator'):
-                mh_norm = model.resonator(context_vec).norm().item()
+# === 12. Checkpoint Saving ===
+def save_checkpoint(model, opt, config, epoch, filename_prefix="training-checkpoint-epoch"):
+    state = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': opt.state_dict(),
+        'epoch': epoch + 1,
+        'config': config,
+        'final_resonant_state': getattr(model, '_res_tokens_for_ri', None)
+    }
+    filename = f"{filename_prefix}{epoch+1}.pt"
+    torch.save(state, filename)
+    print(f"Checkpoint saved to {filename} at end of epoch {epoch+1}")
 
-            if (resonant_token_count + dynamic_resonant_token_count) == 0:
-                val_ri = 0.0
-                val_rs = 0.0
-                res_token_norm = 0.0
-                stat_norm = 0.0
-                dyn_norm = 0.0
-                mh_norm = 0.0
-            else:
-                val_ri = ri_v.mean().item()
-                val_rs = rs_v.mean().item()
-                res_token_norm = model._res_tokens_for_ri.norm().item()
-                stat_norm = model.resonant_tokens.norm().item()
-                dyn_norm = model.controller(context_vec).norm().item() if hasattr(model, 'controller') else 0
-                mh_norm = model.resonator(context_vec).norm().item() if hasattr(model, 'resonator') else 0
+def save_final_model(model, config, last_res, filename_prefix="final-model"):
+    millions = int(config["max_tokens"] / 1_000_000)
+    token_part = "BASE" if config["baseline"] else f"{config['resonant_token_count']}-{config['dynamic_resonant_token_count']}"
+    model_filename = f"{token_part}-{config['d_model']}-{config['num_heads']}-{config['num_layers']}-{config['sequence_length']}-{millions}M.pt"
+    state = {
+        'model_state_dict': model.state_dict(),
+        'config': config,
+        'final_resonant_state': last_res
+    }
+    torch.save(state, model_filename)
+    print(f"Model saved to {model_filename} with config and final dynamic resonant state embedded.")
 
-            val_sr = sur_reward.item() if not baseline else 0.0
-            val_akl = akl.item() if not baseline else 0.0
-            val_rr = res_reward.item() if not baseline else 0.0
-            
-            now = time.time()
-            delta_s = now - last_run_time
-            last_run_time = now
 
-            excess_flux_count = model.excess_flux_count  if hasattr(model, "excess_flux_count") else 0
-            loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
-            vector_repairs = global_repair_counter["logits"] + global_repair_counter["resonant output"] + global_repair_counter["hidden state"] + global_repair_counter["context vector"]
 
-            wandb.log({
-                'loss':final.item(),
-                'perplexity':float(np.exp(final.item())),
-                'ri':val_ri,
-                'rs':val_rs,
-                'rs_cos':val_cos_sim,
-                'surprisal_reward':val_sr,
-                'attention_kl':val_akl,
-                'resolution_score':resolution_score,
-                'res_token_norm': res_token_norm,
-                'static_res_norm': stat_norm,
-                'dynamic_res_norm': dyn_norm,
-                'multihead_res_norm': mh_norm,
-                'self_attn_mean':self_attn_mean,
-                'recursive_steps':steps,
-                'last_flux_cost': model.last_flux_cost if hasattr(model, "last_flux_cost") else 0.0,
-                'flux_budget': model.flux_budget if hasattr(model, "flux_budget") else 0.0,
-                'diversity_penalty': dvt.item(),
-                'contrastive_loss': con.item(),
-                'excess_flux_count': excess_flux_count,
-                'entropy_loss_skips': skip_counts["entropy_loss"],
-                'surprisal_loss_skips': skip_counts["surprisal_loss"],
-                'resolution_loss_skips': skip_counts["resolution_loss"],
-                'repairs_logits': global_repair_counter["logits"],
-                'repairs_resonant_output': global_repair_counter["resonant output"],
-                'repairs_hidden_state': global_repair_counter["hidden state"],
-                'repairs_context_vector': global_repair_counter["context vector"]
-            }, step=global_step)
-            print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {bidx} - PPL: {float(np.exp(final.item())):.2f} | NORM: {res_token_norm:.2f} | SUR: {val_sr:.4f} | AKL: {val_akl:.4f} | RES: {resolution_score:.4f} | SELF: {self_attn_mean:.4f} | RI: {val_ri:.4e} | RSC: {val_cos_sim:.4e} | SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | REPAIRS: {vector_repairs}")
 
-    # === Save checkpoint at end of this epoch ===
-    if (epoch + 1) % 10 == 0:
-        state = {
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': opt.state_dict(),
-            'epoch': epoch + 1,
-            'config': {
-                'vocab_size': tokenizer.get_vocab_size(),
-                'sequence_length': sequence_length,
-                'd_model': d_model,
-                'num_heads': num_heads,
-                'num_layers': num_layers,
-                'max_tokens': max_tokens,
-                'learning_rate': learning_rate,
-                'batch_size': batch_size,
-                'num_epochs': num_epochs,
-                'warmup_epochs': warmup_epochs,
-                'resonant_token_count': resonant_token_count,
-                'dynamic_resonant_token_count': dynamic_resonant_token_count,
-                'multihead': multihead_resonance,
-                'max_recursive_steps': max_recursive_steps,
-                'recursive_convergence_tolerance': recursive_convergence_tolerance,
-                'flux_penalty_weight': flux_penalty_weight
-            },
-            'final_resonant_state': getattr(model, '_res_tokens_for_ri', None)
-        }
-        epoch_filename = f"training-checkpoint-epoch{epoch+1}.pt"
-        torch.save(state, epoch_filename)
-        print(f"Checkpoint saved to {epoch_filename} at end of epoch {epoch+1}")
-
-# Save final state
-state = {
-    'model_state_dict': model.state_dict(),
-    'config': {
-        'baseline': baseline,
-        'vocab_size': tokenizer.get_vocab_size(),
-        'sequence_length': sequence_length,
-        'd_model': d_model,
-        'num_heads': num_heads,
-        'num_layers': num_layers,
-        'max_tokens': max_tokens,
-        'learning_rate': learning_rate,
-        'batch_size': batch_size,
-        'num_epochs': num_epochs,
-        'warmup_epochs': warmup_epochs,
-        'resonant_token_count': resonant_token_count,
-        'dynamic_resonant_token_count': dynamic_resonant_token_count,
-        'multihead': multihead_resonance,
-        'max_recursive_steps': max_recursive_steps,
-        'recursive_convergence_tolerance': recursive_convergence_tolerance,
-        'flux_penalty_weight': flux_penalty_weight
-    },
-    'final_resonant_state': last_res
-}
-millions = int(max_tokens / 1_000_000)
-token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
-model_filename = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M.pt"
-torch.save(state, model_filename)
-print(f"Model saved to {model_filename} with config and final dynamic resonant state embedded.")
+# === 13. Main Driver ===
+if __name__ == "__main__":
+    DEVICE, config = prepare_environment()
+    corpus_path    = prepare_dataset()
+    tokenizer      = setup_tokenizer(corpus_path, vocab_size=config["vocab_size"])
+    all_sequences  = encode_corpus(corpus_path, tokenizer, sequence_length=config["sequence_length"], max_tokens=config["max_tokens"])
+    loader         = create_dataloader(all_sequences, tokenizer, batch_size=config["batch_size"])
+    
+    model, scaler, attn_records = build_model(config, tokenizer, DEVICE)
+    opt, scheduler              = setup_optimizer_and_scheduler(model, config, dataset_size=len(all_sequences), device_type=DEVICE.type)
+    
+    train(model, loader, opt, scheduler, config, DEVICE, tokenizer)

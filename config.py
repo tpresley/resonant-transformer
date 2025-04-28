@@ -4,7 +4,9 @@
 # Standard Hyperparameters
 #####
 
-baseline=True
+baseline=False
+
+wandb_project_name = "resonant-transformer-refactored"
 
 d_model = 256
 num_heads = 4

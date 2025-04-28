@@ -142,6 +142,7 @@ class EnhancedResonantTransformer(nn.Module):
                  multihead=False,
                  max_recursive_steps: int = 3):
         super().__init__()
+        self.baseline = baseline
         self.global_res = None
         self.surprisal_trajectory = []
         self.attention_trajectory = []
@@ -472,8 +473,13 @@ class EnhancedResonantTransformer(nn.Module):
                 past_internal_states.pop(0)
 
             # === Update context_vec via EMA ===
-            res_tokens_only = full_out[:, :res.size(1), :].detach()  # [B, R, D]
-            new_context_vec = res_tokens_only.mean(dim=1)  # [B, D]
+            if not self.baseline and res is not None and res.numel() > 0:
+                res_tokens_only = full_out[:, :res.size(1), :].detach()  # [B, R, D]
+                new_context_vec = res_tokens_only.mean(dim=1)
+            else:
+                # Recompute context from input tokens safely
+                ctx_emb = self.embedding(x)  # [B, L, D]
+                new_context_vec = ctx_emb.mean(dim=1)  # [B, D]
 
             if context is not None:
                 if context.dtype in (torch.int64, torch.int32):
