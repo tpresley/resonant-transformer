@@ -336,7 +336,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         primary = primary + 0.05 * hidden_contrastive_loss
         primary = primary + config["flux_penalty_weight"] * flux_penalty
 
-    return primary, con, penalty, sur_reward, akl, res_reward, sur_baseline, res_baseline
+    return primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline
 
 
 
@@ -444,6 +444,7 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
 # === 11. Training Loop ===
 def train(model, loader, opt, scheduler, config, device, tokenizer):
     print("Start Training")
+    model.tokenizer = tokenizer
     last_res = None
     sur_baseline = None
     res_baseline = None
@@ -581,12 +582,15 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         flux_penalty = torch.tensor(0.0, device=device)
         hidden_contrastive_loss = torch.tensor(0.0, device=device)
     else:
-        logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
+        # recursive_forward now returns (logits, hidden, flux, contrastive_loss)
+        logits, _hidden, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
             inp, ctx,
             tol=config["recursive_convergence_tolerance"],
             padding_mask=padding_mask,
             fade_in_strength=fade_in_strength
         )
+        # grab the actual resonant-token output (was formerly the 2nd return)
+        res = model._res_tokens_for_ri
 
     if batch_idx % 10 == 0:
         global_step = epoch * len(loader) + batch_idx
