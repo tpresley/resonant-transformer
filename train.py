@@ -459,9 +459,6 @@ def train_epoch(model, loader, opt, scheduler, config, device, epoch, last_res, 
     model.alpha = cosine_rampup(epoch, config["warmup_epochs"])
     
     if not config["baseline"]:
-        if epoch >= config["warmup_epochs"] and hasattr(model, "max_recursive_steps") and model.max_recursive_steps < config["max_recursive_steps"]:
-            model.max_recursive_steps += 1
-
         if epoch == config["warmup_epochs"] and hasattr(model, 'resonant_attention_scale'):
             model.resonant_attention_scale *= 2
         
