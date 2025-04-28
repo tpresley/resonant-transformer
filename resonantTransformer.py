@@ -270,17 +270,23 @@ class EnhancedResonantTransformer(nn.Module):
             ], dim=1)
 
         if tokens.numel() > 0:
+            # detach history but keep a pure-leaf for RI/RS gradients
             if self.training:
                 self._res_tokens_for_ri = tokens.detach().requires_grad_(True)
             else:
                 self._res_tokens_for_ri = tokens.requires_grad_()
-            if tokens.requires_grad:
-                tokens.retain_grad()
-
-        if self.training:
-            blended_tokens = tokens.detach() * (1 - self.alpha) + tokens * self.alpha
+            # make sure .grad is populated
+            self._res_tokens_for_ri.retain_grad()
         else:
-            blended_tokens = tokens  # preserve full gradient path in eval/inference
+            self._res_tokens_for_ri = tokens  # empty tensor
+
+        # **Use** self._res_tokens_for_ri in the forward pass so gradients land there**
+        if self.training and self._res_tokens_for_ri.numel() > 0:
+            # ramp influence by alpha
+            blended_tokens = (self._res_tokens_for_ri.detach() * (1 - self.alpha)
+                              + self._res_tokens_for_ri * self.alpha)
+        else:
+            blended_tokens = tokens
 
         inp = torch.cat([blended_tokens, emb], dim=1)
 
