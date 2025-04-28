@@ -559,25 +559,28 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
     if config["baseline"]:
-        # no recursion for baseline
         fade_in_strength = 1.0
     else:
-        # Epoch‐based staging: each block of warmup_epochs adds one new step, ramping its influence over that block
         W = config["warmup_epochs"]
         final_steps = config["max_recursive_steps"]
         init_steps = 2
-        # global fractional epoch count
         P = epoch + batch_idx / loader_len
-        # which stage/block we're in
-        stage = int(P // W)
-        # clamp to max additional steps
-        max_stage = max(0, final_steps - init_steps)
-        stage = min(stage, max_stage)
-        # set the number of recursive steps
-        model.max_recursive_steps = init_steps + stage
-        # compute fade‐in for the current stage: 0→1 over W epochs
-        frac = (P - stage * W) / W
-        fade_in_strength = float(min(max(frac, 0.0), 1.0))
+
+        if P < W:
+            # still in initial warmup: no recursive influence
+            model.max_recursive_steps = init_steps
+            fade_in_strength = 0.0
+        else:
+            # after warmup, stage‐1 begins the first ramp for the 3rd step
+            Pp = P - W
+            # which extra-step block we’re in
+            max_stage = max(0, final_steps - init_steps)
+            stage = min(int(Pp // W) + 1, max_stage)
+            # update total rec steps
+            model.max_recursive_steps = init_steps + stage
+            # ramp this stage from 0→1 over one warmup block
+            frac = (Pp - (stage - 1) * W) / W
+            fade_in_strength = float(min(max(frac, 0.0), 1.0))
 
 
     if config["baseline"]:
