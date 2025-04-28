@@ -359,6 +359,7 @@ class EnhancedResonantTransformer(nn.Module):
         hidden_steps = []  # track hidden states across steps
 
         for step in range(num_steps):
+            feedback_strength = 1.0
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
             logits = repair_if_invalid(logits, name="logits", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
