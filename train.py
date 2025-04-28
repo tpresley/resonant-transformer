@@ -262,19 +262,27 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         primary = primary - config["lambda_sur"] * sur_reward
 
         if attn_records and hasattr(model, "avg_attn"):
-            eps = 1e-5  # slightly larger epsilon
-            ca = torch.stack(attn_records).mean(0)  # average across recursion steps
-            cur = ca.mean(0)  # average across batch
-            avg = model.avg_attn
+            eps = 1e-5
+            ca = torch.stack(attn_records).mean(0)  # mean across recursion steps
+            cur = ca.mean(0)  # mean across batch
 
-            akl = (cur * ((cur + eps) / (avg + eps)).log()).sum(-1).mean()
+            # Softmax normalize to make proper distributions
+            cur = F.softmax(cur, dim=-1)
+            avg = F.softmax(model.avg_attn, dim=-1)
+
+            # Add epsilon for numerical stability
+            cur = cur + eps
+            avg = avg + eps
+
+            log_cur = cur.log()
+            akl = F.kl_div(log_cur, avg, reduction='batchmean', log_target=False)
 
             akl = torch.clamp(akl, max=0.1)
             primary = primary - config["lambda_attn"] * akl
 
-            # Update moving average correctly
-            momentum = 0.95
-            model.avg_attn = momentum * model.avg_attn + (1 - momentum) * cur.detach()
+            # Correct moving average update
+            momentum = 0.90  # slightly faster
+            model.avg_attn = momentum * model.avg_attn + (1.0 - momentum) * ca.detach()
 
             del attn_records[:]
 
@@ -625,7 +633,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     last_res = res
 
     # === Every 100 batches: extra inner loop for resonant tokens ===
-    if epoch >= config["warmup_epochs"] and batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
+    if batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
         print("[inner-loop] Resonant token refinement...")
 
         # Freeze everything
@@ -642,6 +650,9 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             inner_res_params.extend(model.resonator.parameters())
         for p in inner_res_params:
             p.requires_grad_(True)
+
+        # Optionally: build a temporary optimizer with higher LR (e.g., 2x)
+        temp_opt = torch.optim.Adam(inner_res_params, lr=2.0 * scheduler.optimizer.param_groups[0]['lr'])
 
         for _ in range(5):
             logits_inner, res_inner, _, _ = model.recursive_forward(
@@ -664,23 +675,25 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                     ri_v_inner = (gr_inner * model._res_tokens_for_ri).sum(dim=-1).abs()
                     rs_v_inner = 1 - F.cosine_similarity(gr_inner, model._res_tokens_for_ri, dim=-1)
                     dvt_inner = diversity_penalty(model._res_tokens_for_ri)
+
+                    # Boost lambda_div slightly
                     token_loss = (
                         config["lambda_ri"] * ri_v_inner.mean() +
                         config["lambda_rs"] * rs_v_inner.mean() +
-                        config["lambda_div"] * dvt_inner
+                        (1.5 * config["lambda_div"]) * dvt_inner
                     )
 
-                opt.zero_grad()
+                temp_opt.zero_grad()
                 token_loss.backward()
-                opt.step()
+                temp_opt.step()
 
-                # Clamp resonant tokens again after update
+                # Clamp resonant tokens
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
                     with torch.no_grad():
                         model._res_tokens_for_ri.clamp_(-5.0, 5.0)
                         model._res_tokens_for_ri.requires_grad_(True)
 
-        # Unfreeze all parameters again
+        # Restore parameter requires_grad
         for p in model.parameters():
             p.requires_grad_(True)
 
