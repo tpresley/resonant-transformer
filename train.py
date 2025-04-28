@@ -390,7 +390,7 @@ def log_metrics(model, primary, con, dvt, sur_reward, akl, res_reward, ctx, epoc
         'repairs_context_vector': global_repair_counter["context vector"],
 
         'self_attn_mean': self_attn_mean,
-        'recursive_steps': recursive_steps,
+        'recursive_steps': 0 if config["baseline"] else getattr(model, "last_recursive_steps", 1),
         'last_flux_cost': last_flux_cost,
         'flux_budget': flux_budget,
     }, step=global_step)
@@ -430,6 +430,10 @@ def train_epoch(model, loader, opt, scheduler, config, device,
                 tokenizer):
     
     print(f"Start Epoch {epoch+1}/{config['num_epochs']}")
+
+    if epoch == 0 and not config["baseline"]:
+        model.max_recursive_steps = 2
+
     model.train()
     model.alpha = cosine_rampup(epoch, config["warmup_epochs"])
     
@@ -509,28 +513,34 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     ctx = last_res if last_res is not None else inp
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
-    # === Calculate smooth fade_in_strength for recursive steps ===
-    if epoch < config["warmup_epochs"]:
-        # During warmup: use global cosine rampup
-        fade_in_strength = cosine_rampup(epoch + batch_idx / len(loader), config["warmup_epochs"])
-    else:
-        # After warmup: each extra step gets smooth fade
-        base_steps = 2  # how many steps were present at warmup
-        added_steps = model.max_recursive_steps - base_steps
-        if added_steps <= 0:
-            fade_in_strength = 1.0
+    fade_in_strength = 1.0
+    if not config["baseline"]:
+        # === Calculate smooth fade_in_strength for recursive steps ===
+        if epoch < config["warmup_epochs"]:
+            fade_in_strength = cosine_rampup(epoch + batch_idx / len(loader), config["warmup_epochs"])
         else:
-            # How much time has passed since warmup (in epochs)
-            epochs_since_warmup = (epoch - config["warmup_epochs"]) + (batch_idx / len(loader))
-            total_fade_time = added_steps * 5.0  # each step gets 5 epochs to fade
-            fade_in_strength = min(1.0, max(0.0, epochs_since_warmup / total_fade_time))
+            base_steps = 2
+            added_steps = model.max_recursive_steps - base_steps
+            if added_steps <= 0:
+                fade_in_strength = 1.0
+            else:
+                epochs_since_warmup = (epoch - config["warmup_epochs"]) + (batch_idx / len(loader))
+                total_fade_time = added_steps * 5.0
+                fade_in_strength = min(1.0, max(0.0, epochs_since_warmup / total_fade_time))
 
-    logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
-        inp, ctx,
-        tol=config["recursive_convergence_tolerance"],
-        padding_mask=padding_mask,
-        fade_in_strength=fade_in_strength
-    )
+    if config["baseline"]:
+        baseline_outputs = model.forward(inp, context=ctx, padding_mask=padding_mask)
+        logits = baseline_outputs[0]  # <-- Fix: only take logits
+        res = None
+        flux_penalty = torch.tensor(0.0, device=device)
+        hidden_contrastive_loss = torch.tensor(0.0, device=device)
+    else:
+        logits, res, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
+            inp, ctx,
+            tol=config["recursive_convergence_tolerance"],
+            padding_mask=padding_mask,
+            fade_in_strength=fade_in_strength
+        )
 
     if batch_idx % 10 == 0:
         global_step = epoch * len(loader) + batch_idx
