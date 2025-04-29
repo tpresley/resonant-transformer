@@ -232,8 +232,18 @@ def setup_optimizer_and_scheduler(model, config, dataset_size, device_type="cuda
 def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
                    skip_counts, attn_records, sur_baseline, res_baseline,
                    hidden_contrastive_loss, flux_penalty):
-    crit = torch.nn.CrossEntropyLoss(ignore_index=model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else 0)
-    primary = crit(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1))
+    # --- Manual masked CE: ignore tgt pads but don't let the model exploit that ---
+    pad_id = model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else -100
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    tgt_flat    = tgt.reshape(-1)
+    ce_per_tok  = F.cross_entropy(logits_flat, tgt_flat, reduction='none')
+    nonpad_mask = (tgt_flat != pad_id).float()
+    primary     = (ce_per_tok * nonpad_mask).sum() / (nonpad_mask.sum() + 1e-12)
+
+    # --- Explicit anti-pad penalty (tune lambda_pad in config.py) —
+    pad_probs = torch.softmax(logits, dim=-1)[..., pad_id]    # [B, L]
+    pad_rate  = pad_probs.mean()                              # scalar in [0,1]
+    primary  += config.get('lambda_pad', 1.0) * pad_rate
 
     con = penalty = sur_reward = akl = res_reward = dvt = torch.tensor(0.0, device=device)
     # Ramp diversity weight from 0 → λ_div over the full training run
@@ -668,11 +678,13 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     logits = logits[:, 1:1 + inp.size(1)]
 
     # compute raw CE for correct PPL logging before any augmentations
-    ce_loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        tgt.reshape(-1),
-        ignore_index=tokenizer.token_to_id("<pad>")
-    )
+    # For logging true PPL use the same masked CE (no ignore_index cheat)
+    pad_id   = tokenizer.token_to_id("<pad>")
+    flat_l   = logits.reshape(-1, logits.size(-1))
+    flat_t   = tgt.reshape(-1)
+    ce_per_t = F.cross_entropy(flat_l, flat_t, reduction='none')
+    mask     = (flat_t != pad_id).float()
+    ce_loss  = (ce_per_t * mask).sum() / (mask.sum() + 1e-12)
     ppl = float(torch.exp(ce_loss))
 
     primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline = compute_losses(
@@ -698,7 +710,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
 
     last_res = res
 
-    if batch_idx % 500 == 0:
+    if global_step % 500 == 0:
         sample = tokenizer.decode(logits.argmax(-1)[0].tolist())
         print(f"[SAMPLE @ {global_step}]:", sample[:200])
 
