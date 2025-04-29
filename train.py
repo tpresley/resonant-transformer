@@ -38,7 +38,7 @@ def prepare_environment():
         sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
-        flux_penalty_weight
+        flux_penalty_weight, contrastive_margin, lambda_contrastive
     )
     if baseline:
         resonant_token_count = 0
@@ -59,7 +59,8 @@ def prepare_environment():
         "lambda_sur": lambda_sur, "lambda_attn": lambda_attn, "lambda_res": lambda_res,
         "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
         "recursive_convergence_tolerance": recursive_convergence_tolerance,
-        "flux_penalty_weight": flux_penalty_weight
+        "flux_penalty_weight": flux_penalty_weight, "contrastive_margin": contrastive_margin,
+        "lambda_contrastive": lambda_contrastive
     }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
@@ -307,33 +308,24 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
 
         ci = inp.clone()
         ci[:, -1] = torch.randint(0, logits.size(-1), (inp.size(0),), device=device)
+        # ── compute contrastive loss with blown-up margin & heavy weight ──
         with torch.no_grad():
-            contrast_logits, _, _, _ = model.recursive_forward(ci, ci, tol=config["recursive_convergence_tolerance"])
-            # use a larger margin so contrastive_loss doesn’t collapse to 0 immediately
-            contrastive_loss_val = contrastive_loss(logits, contrast_logits, margin=5.0)
-            min_contrastive_loss = 1e-4
-            if contrastive_loss_val.item() < min_contrastive_loss:
-                rescue_boost = (min_contrastive_loss - contrastive_loss_val.item()) * 10.0
-                contrastive_loss_val = contrastive_loss_val + rescue_boost
-            con = contrastive_loss_val
+            contrast_logits, _, _, _ = model.recursive_forward(
+                ci, ci,
+                tol=config["recursive_convergence_tolerance"]
+            )
+        raw_con = contrastive_loss(
+            logits,
+            contrast_logits,
+            margin=config["contrastive_margin"]
+        )
+        con = config["lambda_contrastive"] * raw_con
 
         lp_ent = F.log_softmax(logits, dim=-1)
         pr_ent = lp_ent.exp().clamp(min=1e-5, max=1-1e-5)
         lp_ent = torch.log(pr_ent)
         ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
         primary = primary - 1e-4 * ent_loss
-
-        # if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-        #     gr_tuple = torch.autograd.grad(primary, model._res_tokens_for_ri, retain_graph=True, create_graph=True, allow_unused=True)
-        #     gr = gr_tuple[0]
-        #     if gr is not None:
-        #         penalty = (
-        #             config["lambda_ri"] * (gr * model._res_tokens_for_ri).sum(dim=-1).abs().mean()
-        #             + config["lambda_rs"] * (1 - F.cosine_similarity(gr, model._res_tokens_for_ri, dim=-1)).mean()
-        #             + diversity_weight * diversity_penalty(model._res_tokens_for_ri)
-        #         )
-
-        # primary = primary - penalty
 
         # Manual autograd.grad hack removed – resonant-token penalties
         # will now flow via the inner-loop/backward pass.
@@ -367,17 +359,17 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
     loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
     vector_repairs = sum(global_repair_counter.values())
 
-    # === Compute RI / RS / RS_COS from resonant-token gradients ===
+    # === Compute RI / RS / RS_COS from the static bank’s parameter grads ===
     ri_val, rs_val, rs_cos_val = 0.0, 0.0, 0.0
-    if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-        grad = model._res_tokens_for_ri.grad
-        if grad is not None:
-            # RI = <g, r> magnitude
-            ri_val = (grad * model._res_tokens_for_ri).sum(dim=-1).abs().mean().item()
-            # cosine similarity between g and r
-            cos_sim = F.cosine_similarity(grad, model._res_tokens_for_ri, dim=-1)
-            rs_val = (1.0 - cos_sim).mean().item()
-            rs_cos_val = cos_sim.mean().item()
+    if hasattr(model, 'resonant_tokens') and model.resonant_tokens.grad is not None:
+        # take the parameter tensor and its gradient
+        bank = model.resonant_tokens.detach()          # [1, R, D]
+        g = model.resonant_tokens.grad                 # same shape
+        # flatten token-dimension for dot products
+        ri_val = (g * bank).sum(dim=-1).abs().mean().item()
+        cos_sim = F.cosine_similarity(g, bank, dim=-1)
+        rs_cos_val = cos_sim.mean().item()
+        rs_val = (1.0 - cos_sim).mean().item()
 
     self_attn_mean = model.attention_trajectory[-1] if hasattr(model, "attention_trajectory") and model.attention_trajectory else 0.0
     recursive_steps = getattr(model, "last_recursive_steps", 0)
@@ -620,19 +612,29 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
 
     # === Immediately after forward pass, repair resonant tokens ===
     if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-        with torch.no_grad():
-            # Repair any NaNs
-            mask = torch.isnan(model._res_tokens_for_ri)
-            if mask.any():
-                print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
-                model._res_tokens_for_ri.data[mask] = 0.0
+    #     with torch.no_grad():
+    #         # Repair any NaNs
+    #         mask = torch.isnan(model._res_tokens_for_ri)
+    #         if mask.any():
+    #             print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
+    #             model._res_tokens_for_ri.data[mask] = 0.0
 
-            # Soft project onto hypersphere (in-place so we don’t break the grad graph)
-            new_proj = hard_project_onto_hypersphere(
-                model._res_tokens_for_ri.data,
-                radius=1.0
+    #         # Soft project onto hypersphere (in-place so we don’t break the grad graph)
+    #         new_proj = hard_project_onto_hypersphere(
+    #             model._res_tokens_for_ri.data,
+    #             radius=1.0
+    #         )
+    #         model._res_tokens_for_ri.data.copy_(new_proj)
+        # Repair any NaNs (kept in-graph)
+        mask = torch.isnan(model._res_tokens_for_ri)
+        if mask.any():
+            print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
+            model._res_tokens_for_ri = torch.nan_to_num(
+                model._res_tokens_for_ri, nan=0.0, posinf=1.0, neginf=-1.0
             )
-            model._res_tokens_for_ri.data.copy_(new_proj)
+        # Differentiable projection onto unit sphere (preserve gradient path)
+        norm = model._res_tokens_for_ri.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        model._res_tokens_for_ri = model._res_tokens_for_ri / norm
 
     if res is not None:
         with torch.no_grad():

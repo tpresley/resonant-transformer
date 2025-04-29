@@ -238,7 +238,8 @@ class EnhancedResonantTransformer(nn.Module):
         # Gather resonant token sources
         res_list = []
         if self.static_resonant_token_count > 0:
-            static = self.resonant_tokens.expand(B, -1, -1).clone()
+            # use an expand-view directly (no clone) so grads flow back into the param
+            static = self.resonant_tokens.expand(B, -1, -1)
             res_list.append(static)
 
         if self.dynamic_resonant_token_count > 0:
@@ -270,8 +271,9 @@ class EnhancedResonantTransformer(nn.Module):
             ], dim=1)
 
         if tokens.numel() > 0:
-            # keep full graph history so gradients reach resonant_tokens & controller
+            # ensure tokens require gradients so we can retain them for RI/RS
             self._res_tokens_for_ri = tokens.requires_grad_(True)
+            self._res_tokens_for_ri.retain_grad()
         else:
             self._res_tokens_for_ri = tokens  # empty tensor
 
@@ -606,10 +608,15 @@ class LawfulLinear(nn.Module):
 
 
 def contrastive_loss(original_logits, contrast_logits, margin=1.0):
-    orig_repr = original_logits.mean(dim=1)
+    """
+    Soft‐hinge contrastive: F.softplus(margin – dist) keeps a smooth, nonzero gradient
+    even once dist > margin.
+    """
+    orig_repr     = original_logits.mean(dim=1)
     contrast_repr = contrast_logits.mean(dim=1)
-    dist = F.pairwise_distance(orig_repr, contrast_repr, p=2)
-    return torch.clamp(margin - dist, min=0).mean()
+    dist          = F.pairwise_distance(orig_repr, contrast_repr, p=2)
+    loss          = F.softplus(margin - dist)    # => always > 0, grad = sigmoid(margin - dist)
+    return loss.mean()
 
 def inject_resonant_noise(tokens, noise_level=0.1):
     noise = torch.randn_like(tokens)

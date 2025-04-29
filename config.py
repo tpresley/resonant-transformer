@@ -51,3 +51,9 @@ multihead_resonance = True  # boolean flag for multihead resonance
 max_recursive_steps = 5
 recursive_convergence_tolerance = 1e-5
 flux_penalty_weight = 0.01
+
+#####
+# Contrastive Loss Parameters
+#####
+contrastive_margin   = 50.0    # Blow up the margin so dist rarely exceeds it
+lambda_contrastive   = 5.0     # Heavily weight contrastive loss in the total
