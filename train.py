@@ -350,6 +350,7 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
 
     global_step = epoch * loader_len + batch_idx
     # ppl = float(np.exp(primary.item())) if primary.item() < 100 else float('inf')
+    pplc = float(np.exp(primary.item())) if primary.item() < 100 else float('inf')
 
     res_token_norm = 0.0
     stat_norm = 0.0
@@ -409,6 +410,7 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
     wandb.log({
         'loss': primary.item(),
         'perplexity': ppl,
+        'perplexity_composite': pplc,
         'surprisal_reward': sur_reward.item() if sur_reward is not None else 0.0,
         'attention_kl': akl.item() if akl is not None else 0.0,
         'resolution_score': res_reward.item() if res_reward is not None else 0.0,
@@ -444,12 +446,10 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
     }, step=global_step)
 
     print(f"{delta_s:.1f}: {global_step} | {epoch+1} | {batch_idx} - "
-          f"PPL: {ppl:.2f} | NORM: {res_token_norm:.2f} | "
+          f"PPL: {ppl:.2f} | PPLC: {pplc:.2f} | NORM: {res_token_norm:.2f} | "
           f"SUR: {sur_reward.item():.4f} | AKL: {akl.item():.4f} | "
           f"RES: {res_reward.item():.4f} | "
-          f"RI: {ri_val:.4e} | RS: {rs_val:.4e} | RS_COS: {rs_cos_val:.4e} | "
-          f"SKIPS: {loss_reward_skips} | EFC: {excess_flux_count} | "
-          f"REPAIRS: {vector_repairs}")
+          f"RI: {ri_val:.4e} | RS: {rs_val:.4e} | RS_COS: {rs_cos_val:.4e} | ")
 
 
 
@@ -697,6 +697,10 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         scheduler.step()
 
     last_res = res
+
+    if batch_idx % 500 == 0:
+        sample = tokenizer.decode(logits.argmax(-1)[0].tolist())
+        print(f"[SAMPLE @ {global_step}]:", sample[:200])
 
     # === Every 100 batches: extra inner loop for resonant tokens ===
     if batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
