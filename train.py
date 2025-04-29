@@ -710,6 +710,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
 
     last_res = res
 
+    global_step = epoch * loader_len + batch_idx
     if global_step % 500 == 0:
         sample = tokenizer.decode(logits.argmax(-1)[0].tolist())
         print(f"[SAMPLE @ {global_step}]:", sample[:200])
