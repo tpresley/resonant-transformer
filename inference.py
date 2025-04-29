@@ -91,7 +91,7 @@ model = EnhancedResonantTransformer(
     num_layers=model_config["num_layers"],
     resonant_token_count=model_config["resonant_token_count"],
     dynamic_resonant_token_count=model_config["dynamic_resonant_token_count"],
-    multihead=model_config.get("multihead", False),
+    multihead=model_config.get("multihead_resonance", False),
     max_recursive_steps=model_config["max_recursive_steps"] if hasattr(model_config, "max_recursive_steps") else 5,
     # flux_penalty_weight=model_config["flux_penalty_weight"]
 )
@@ -162,7 +162,7 @@ while True:
             context = prepare_context(model, input_seq)
 
             if not baseline:
-                logits, _, _ = model.recursive_forward(
+                logits, _, _, _ = model.recursive_forward(
                     input_seq,
                     context=context,
                     tol=recursive_convergence_tolerance,
