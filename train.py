@@ -353,8 +353,6 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
 
     res_token_norm = 0.0
     stat_norm = 0.0
-    dyn_norm = 0.0
-    mh_norm = 0.0
     excess_flux_count = getattr(model, "excess_flux_count", 0)
     loss_reward_skips = skip_counts["entropy_loss"] + skip_counts["surprisal_loss"] + skip_counts["resolution_loss"]
     vector_repairs = sum(global_repair_counter.values())
@@ -392,10 +390,20 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
             ctx_vec = ctx.mean(dim=1)
 
     if ctx_vec is not None:
+        # NEW: track the *learnable* parts on controller & multi-head
+        dyn_weight_norm = dyn_grad_norm = 0.0
         if hasattr(model, 'controller') and model.controller is not None:
-            dyn_norm = model.controller(ctx_vec).norm().item()
+            w = model.controller.linear.delta_weight
+            dyn_weight_norm = w.norm().item()
+            if w.grad is not None:
+                dyn_grad_norm = w.grad.norm().item()
+
+        mh_weight_norm = mh_grad_norm = 0.0
         if hasattr(model, 'resonator') and model.resonator is not None:
-            mh_norm = model.resonator(ctx_vec).norm().item()
+            bank = model.resonator.resonant_bank
+            mh_weight_norm = bank.norm().item()
+            if bank.grad is not None:
+                mh_grad_norm = bank.grad.norm().item()
 
 
     wandb.log({
@@ -406,8 +414,15 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
         'resolution_score': res_reward.item() if res_reward is not None else 0.0,
         'res_token_norm': res_token_norm,
         'static_res_norm': stat_norm,
-        'dynamic_res_norm': dyn_norm,
-        'multihead_res_norm': mh_norm,
+
+        # controller (dynamic) parameter norms & grads
+        'dyn_controller_weight_norm': dyn_weight_norm,
+        'dyn_controller_grad_norm':   dyn_grad_norm,
+
+        # multihead parameter norms & grads
+        'mh_resonator_weight_norm':   mh_weight_norm,
+        'mh_resonator_grad_norm':     mh_grad_norm,
+
         'contrastive_loss': con.item(),
         'diversity_penalty': dvt.item(),
         'excess_flux_count': excess_flux_count,
