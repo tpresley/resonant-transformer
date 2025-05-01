@@ -203,18 +203,27 @@ def setup_optimizer_and_scheduler(model, config, dataset_size, device_type="cuda
     num_epochs = config["num_epochs"]
     baseline = config["baseline"]
 
-    if not baseline:
-        optimizer = torch.optim.Adam([
-            {'params': [p for n, p in model.named_parameters()
-                        if all(x not in n for x in ['resonant_tokens', 'controller', 'resonator'])],
-             'lr': learning_rate}
-        ])
-    else:
-        optimizer = torch.optim.Adam([
-            {'params': [p for n, p in model.named_parameters()
-                        if 'resonant_tokens' not in n and 'controller' not in n and 'resonator' not in n],
-             'lr': learning_rate, 'weight_decay': weight_decay}
-        ])
+    # decide which parameter-names to exclude in baseline mode
+    exclude_keys = [] if baseline else ['resonant_tokens', 'controller', 'resonator']
+
+    # split params into decay / no_decay
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(key in name for key in exclude_keys):
+            continue
+        # no weight decay on biases or normalization layers
+        if name.endswith('.bias') or 'norm' in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer_grouped = [
+        { 'params': decay_params,    'lr': learning_rate, 'weight_decay': config['weight_decay'] },
+        { 'params': no_decay_params, 'lr': learning_rate, 'weight_decay': 0.0 }
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped)
 
     steps_per_epoch = dataset_size // batch_size
     total_training_steps = steps_per_epoch * num_epochs
@@ -735,7 +744,9 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             p.requires_grad_(True)
 
         # Optionally: build a temporary optimizer with higher LR (e.g., 2x)
-        temp_opt = torch.optim.Adam(inner_res_params, lr=2.0 * scheduler.optimizer.param_groups[0]['lr'])
+        temp_opt = torch.optim.Adam(inner_res_params,
+                         lr=2.0 * scheduler.optimizer.param_groups[0]['lr'],
+                         weight_decay=0.0)
 
         for _ in range(5):
             logits_inner, res_inner, _, _ = model.recursive_forward(
