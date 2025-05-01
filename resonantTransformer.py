@@ -631,12 +631,39 @@ class LawfulLinear(nn.Module):
             nn.init.uniform_(self.bias_base, -bound, bound)
 
     def forward(self, x):
-        # disable AMP here so we never combine weights in FP16
-        with autocast(device_type=self.device, enabled=False):
-            weight = self.weight_base + self.delta_weight * self.raf_modulation
-            bias   = (self.bias_base + self.delta_bias * self.raf_modulation
-                      if self.bias_base is not None else None)
-        return nn.functional.linear(x, weight, bias)
+        # if here, we know we’re in the offending module
+        #  a) check raf_modulation
+        if not torch.isfinite(torch.tensor(self.raf_modulation)):
+            print(f"[🚨 NaN/∞ DETECTED] raf_modulation={self.raf_modulation}")
+            raise RuntimeError("Bad raf_modulation")
+
+        # b) build your weight & bias
+        with torch.cuda.amp.autocast(enabled=False):
+            wb = self.weight_base
+            dw = self.delta_weight
+            weight = wb + dw * self.raf_modulation
+
+            # sniff them
+            if torch.isnan(weight).any() or torch.isinf(weight).any():
+                print(f"[🚨 NaN/∞ in weight] wb + dw*mod has NaNs/Infs:",
+                    torch.isnan(weight).sum().item(),
+                    torch.isinf(weight).sum().item())
+                raise RuntimeError("Bad weight in LawfulLinear")
+
+            if self.bias_base is not None:
+                bb = self.bias_base
+                db = self.delta_bias
+                bias = bb + db * self.raf_modulation
+                if torch.isnan(bias).any() or torch.isinf(bias).any():
+                    print(f"[🚨 NaN/∞ in bias] bb + db*mod has NaNs/Infs:",
+                        torch.isnan(bias).sum().item(),
+                        torch.isinf(bias).sum().item())
+                    raise RuntimeError("Bad bias in LawfulLinear")
+            else:
+                bias = None
+
+        return F.linear(x, weight, bias)
+
 
 
 

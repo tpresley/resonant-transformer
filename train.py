@@ -672,6 +672,13 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                 last_res, sur_baseline, res_baseline, global_repair_counter, skip_counts,
                 attn_records, loader_len, tokenizer, fade_in_progress, current_recursive_target_steps):
 
+    for name, p in model.named_parameters():
+        if p.requires_grad and (torch.isnan(p).any() or torch.isinf(p).any()):
+            print(f"[🚨 NaN/∞ DETECTED IN PARAM] {name}:",
+                  "NaNs:", torch.isnan(p).sum().item(),
+                  "Infs:", torch.isinf(p).sum().item())
+            raise RuntimeError(f"Stopping early: {name} is invalid")
+
     model.excess_flux_count = 0
 
     inp = batch[:, :-1].to(device)
