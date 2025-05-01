@@ -811,6 +811,15 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     model.scaler.step(opt)
     model.scaler.update()
 
+    # — sanitize Adam’s momentum buffers to drop any Inf/NaN —
+    for state in opt.state.values():
+        for buf in ("exp_avg", "exp_avg_sq"):
+            if buf in state:
+                state[buf].data = torch.nan_to_num(
+                    state[buf].data,
+                    nan=0.0, posinf=1e4, neginf=-1e4
+                )
+
     # ——— sanitize every parameter so no NaNs/Infs can persist ———
     with torch.no_grad():
         for name, p in model.named_parameters():
