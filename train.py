@@ -36,7 +36,7 @@ def prepare_environment():
         baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
         resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
         sequence_length, max_tokens, learning_rate, batch_size, num_epochs, 
-        lr_warmup_epochs, label_smoothing, warmup_epochs,
+        lr_warmup_epochs, embedding_dropout, label_smoothing, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive
@@ -54,7 +54,7 @@ def prepare_environment():
         "baseline": baseline, "d_model": d_model, "num_heads": num_heads, "num_layers": num_layers,
         "vocab_size": vocab_size, "weight_decay": weight_decay, "resonant_token_count": resonant_token_count,
         "dynamic_resonant_token_count": dynamic_resonant_token_count, "token_learning_amplifier": token_learning_amplifier,
-        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate,
+        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate, "embedding_dropout": embedding_dropout,
         "batch_size": batch_size, "num_epochs": num_epochs, "lr_warmup_epochs": lr_warmup_epochs, 
         "label_smoothing": label_smoothing, "warmup_epochs": warmup_epochs,
         "lambda_ri": lambda_ri, "lambda_rs": lambda_rs, "lambda_div": lambda_div,
@@ -169,7 +169,8 @@ def build_model(config, tokenizer, device):
         resonant_token_count=config["resonant_token_count"],
         dynamic_resonant_token_count=config["dynamic_resonant_token_count"],
         multihead=config["multihead_resonance"],
-        max_recursive_steps=config["max_recursive_steps"]
+        max_recursive_steps=config["max_recursive_steps"],
+        embedding_dropout=config["embedding_dropout"]
     ).to(device)
     model.train()
     torch.autograd.set_detect_anomaly(True)

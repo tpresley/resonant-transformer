@@ -140,9 +140,12 @@ class EnhancedResonantTransformer(nn.Module):
                  baseline=False,
                  resonant_token_count=0, dynamic_resonant_token_count=0,
                  multihead=False,
-                 max_recursive_steps: int = 3):
+                 max_recursive_steps: int = 3,
+                 embedding_dropout: float = 0.1):
         super().__init__()
         self.baseline = baseline
+        # embedding dropout
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
         self.global_res = None
         self.surprisal_trajectory = []
         self.attention_trajectory = []
@@ -211,6 +214,7 @@ class EnhancedResonantTransformer(nn.Module):
 
     def forward(self, x, context=None, update_global=True, padding_mask=None, segment_ids=None):
         emb = self.embedding(x)
+        emb = self.embedding_dropout(emb)
         B = emb.size(0)
         self_tok = self.self_token.expand(B, -1, -1)
         emb = torch.cat([self_tok, emb], dim=1)
@@ -230,6 +234,7 @@ class EnhancedResonantTransformer(nn.Module):
         if context is not None:
             if context.dtype in (torch.int64, torch.int32):
                 ctx_emb = self.embedding(context)  # [B, L, D]
+                ctx_emb = self.embedding_dropout(ctx_emb)
                 context_vec = ctx_emb.mean(dim=1)  # [B, D]
             elif context.dim() == 2:
                 # Already [B, D], use directly

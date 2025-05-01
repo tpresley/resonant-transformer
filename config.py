@@ -4,7 +4,7 @@
 # Standard Hyperparameters
 #####
 
-baseline=False
+baseline=True
 
 wandb_project_name = "resonant-transformer-refactored"
 
@@ -13,12 +13,15 @@ num_heads = 4
 num_layers = 6
 vocab_size = 1024
 sequence_length = 128
-max_tokens = 1_000_000
+max_tokens = 20_000_000
 learning_rate = 1e-4
 weight_decay = 0.01
 batch_size = 256
 num_epochs = 50
-
+# How many epochs to linearly warm up LR (e.g. 5% of total)
+lr_warmup_epochs = max(1, int(0.05 * num_epochs))
+label_smoothing = 0.1
+embedding_dropout = 0.1
 
 #####
 # Resonant Token Parameters
