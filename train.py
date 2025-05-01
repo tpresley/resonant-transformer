@@ -530,7 +530,7 @@ def train(model, train_loader, val_loader, opt, scheduler, config, device, token
         model.eval()
         total_ce = 0.0
         total_tokens = 0
-        with torch.no_grad(), autocast(enabled=(device.type=="cuda")):
+        with torch.no_grad(), autocast(device_type=device.type, enabled=(device.type=="cuda")):
             val_last_res = None
             for batch, lengths in val_loader:
                 inp = batch[:, :-1].to(device)
@@ -693,7 +693,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     else:
         # recursive_forward now returns (logits, hidden, flux, contrastive_loss)
         # mixed‐precision forward
-        with autocast(enabled=(device.type == "cuda")):
+        with autocast(device_type=device.type, enabled=(device.type == "cuda")):
             logits, _hidden, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
                 inp, ctx,
                 tol=config["recursive_convergence_tolerance"],
