@@ -194,7 +194,15 @@ class EnhancedResonantTransformer(nn.Module):
             dropout=0.1
         ) for _ in range(num_layers)]
         self.encoder_layers = nn.ModuleList(layers)
+        # final token‐to‐vocab projection
         self.output = LawfulLinear(d_model, vocab_size)
+        # --- Weight tying: share input & output weights ---
+        # Ensure the output’s weight_base Parameter references the same data as the embedding
+        # (they must have identical shape: [vocab_size, d_model])
+        # self.output.weight_base = self.embedding.weight
+
+        del self.output._parameters['weight_base']
+        self.output.register_parameter('weight_base', self.embedding.weight)
 
     def forward(self, x, context=None, update_global=True, padding_mask=None, segment_ids=None):
         emb = self.embedding(x)
