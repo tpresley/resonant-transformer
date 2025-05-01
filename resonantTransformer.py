@@ -617,8 +617,8 @@ class LawfulLinear(nn.Module):
 
         self.raf_modulation = 1.0  # Default modulation factor
 
-        self.device = torch.device("mps") if torch.backends.mps.is_available() else (
-             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = "mps" if torch.backends.mps.is_available() else (
+             "cuda" if torch.cuda.is_available() else "cpu")
 
 
         self.reset_parameters()
