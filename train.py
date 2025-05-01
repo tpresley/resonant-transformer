@@ -684,7 +684,12 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     inp = batch[:, :-1].to(device)
     tgt = batch[:, 1:].to(device)
 
-    ctx = last_res if last_res is not None else inp
+    if last_res is None:
+        ctx = inp
+    else:
+        alpha = min(1.0, (epoch + batch_idx/loader_len) / config["warmup_epochs"])
+        ctx = alpha * last_res.detach() + (1-alpha) * inp
+
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
     if config["baseline"]:
