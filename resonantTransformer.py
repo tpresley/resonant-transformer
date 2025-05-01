@@ -649,24 +649,15 @@ def inject_resonant_noise(tokens, noise_level=0.1):
     return tokens + noise_level * noise
 
 def diversity_penalty(x):
-    """
-    x: [batch, tokens, dim]
-    Computes penalty encouraging tokens to be orthogonal and diverse.
-    """
-    if torch.isnan(x).any():
-        print("[diversity_penalty] WARNING: NaNs detected in resonant tokens! Repairing...")
-        with torch.no_grad():
-            x.data = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    x = F.normalize(x, dim=-1, eps=1e-6)  # Normalize each token vector
-    batch_size, num_tokens, dim = x.size()
-
-    sim_matrix = torch.einsum('btd,bkd->btk', x, x)  # [batch, tokens, tokens]
-    mask = torch.eye(num_tokens, device=x.device).bool().unsqueeze(0)  # [1, tokens, tokens]
-    sim_matrix.masked_fill_(mask, 0.0)
-
-    penalty = (sim_matrix ** 2).mean()
-    return penalty
+    # sanitize in-graph
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+    x = F.normalize(x, dim=-1, eps=1e-6)
+    b,t,d = x.shape
+    sim = torch.einsum('btd,bkd->btk', x, x)
+    mask = torch.eye(t, device=x.device).bool().unsqueeze(0)
+    sim = sim.masked_fill(mask, 0.0)
+    return sim.pow(2).mean()
 
 def cosine_rampup(t, warmup_epochs):
     if t >= warmup_epochs:
