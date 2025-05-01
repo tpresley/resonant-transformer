@@ -148,6 +148,8 @@ class EnhancedResonantTransformer(nn.Module):
         self.attention_trajectory = []
         self.resolution_score = None
         self.embedding = nn.Embedding(vocab_size, d_model)
+        # — reinitialize embedding to match LawfulLinear’s Kaiming‐uniform scale —
+        nn.init.kaiming_uniform_(self.embedding.weight, a=math.sqrt(5))
         self.static_resonant_token_count = resonant_token_count
         self.dynamic_resonant_token_count = dynamic_resonant_token_count
         self.multihead = multihead
@@ -201,8 +203,11 @@ class EnhancedResonantTransformer(nn.Module):
         # (they must have identical shape: [vocab_size, d_model])
         # self.output.weight_base = self.embedding.weight
 
+        # remove the old base, tie in the embedding
         del self.output._parameters['weight_base']
         self.output.register_parameter('weight_base', self.embedding.weight)
+        # now that weight_base is tied, re-reset base and bias to Kaiming init
+        self.output.reset_parameters()
 
     def forward(self, x, context=None, update_global=True, padding_mask=None, segment_ids=None):
         emb = self.embedding(x)
