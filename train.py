@@ -175,6 +175,8 @@ def build_model(config, tokenizer, device):
     model.train()
     torch.autograd.set_detect_anomaly(True)
     scaler = GradScaler(enabled=(device.type == "cuda"))
+    # attach AMP scaler to the model so train() can use it
+    model.scaler = scaler
     attn_records = []
 
     attn_momentum = 0.95
@@ -643,12 +645,14 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         hidden_contrastive_loss = torch.tensor(0.0, device=device)
     else:
         # recursive_forward now returns (logits, hidden, flux, contrastive_loss)
-        logits, _hidden, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
-            inp, ctx,
-            tol=config["recursive_convergence_tolerance"],
-            padding_mask=padding_mask,
-            fade_in_strength=fade_in_strength
-        )
+        # mixed‐precision forward
+        with autocast(enabled=(device.type == "cuda")):
+            logits, _hidden, flux_penalty, hidden_contrastive_loss = model.recursive_forward(
+                inp, ctx,
+                tol=config["recursive_convergence_tolerance"],
+                padding_mask=padding_mask,
+                fade_in_strength=fade_in_strength
+            )
         # grab the actual resonant-token output (was formerly the 2nd return)
         res = model._res_tokens_for_ri
         # ensure we’ll see its gradient after backward
@@ -723,12 +727,17 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         hidden_contrastive_loss, flux_penalty
     )
 
+    # --- AMP step for the global optimizer ---
     opt.zero_grad()
-    # include contrastive loss so it actually influences gradients
     total_loss = primary + con
-    total_loss.backward()
+    # scale & backward
+    model.scaler.scale(total_loss).backward()
+    # unscale to apply gradient clipping
+    model.scaler.unscale_(opt)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    opt.step()
+    # step & update scaler
+    model.scaler.step(opt)
+    model.scaler.update()
 
     if batch_idx % 10 == 0:
         log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, 
@@ -798,9 +807,12 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                         (1.5 * config["lambda_div"]) * dvt_inner
                     )
 
+                # AMP step for the inner‐loop optimizer
                 temp_opt.zero_grad()
-                token_loss.backward()
+                model.scaler.scale(token_loss).backward()
+                model.scaler.unscale_(temp_opt)
                 temp_opt.step()
+                model.scaler.update()
 
                 # Clamp resonant tokens
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
