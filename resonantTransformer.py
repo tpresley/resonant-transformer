@@ -631,14 +631,15 @@ class LawfulLinear(nn.Module):
             nn.init.uniform_(self.bias_base, -bound, bound)
 
     def forward(self, x):
-        # turn OFF AMP here so weight+delta are always in FP32
+        # turn OFF AMP here so weight+delta and the linear op stay in FP32
         with autocast(device_type=self.device, enabled=False):
             weight = self.weight_base + self.delta_weight * self.raf_modulation
             if self.bias_base is not None:
                 bias = self.bias_base + self.delta_bias * self.raf_modulation
             else:
                 bias = None
-        return F.linear(x, weight, bias)
+            # keep the matmul and bias add in full precision
+            return F.linear(x, weight, bias)
 
 
 
