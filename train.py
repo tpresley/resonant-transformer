@@ -367,18 +367,18 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         )
         con = config["lambda_contrastive"] * raw_con
 
-        # — Stable entropy penalty —
-        # 1) get probabilities
-        probs = torch.softmax(logits, dim=-1)
-        # 2) clamp to avoid exact 0 or 1
-        probs = probs.clamp(min=1e-5, max=1-1e-5)
-        # 3) replace any NaNs/Infs that snuck through
-        probs = torch.nan_to_num(probs,
-                                 nan=1e-5,
-                                 posinf=1-1e-5,
-                                 neginf=1e-5)
-        # 4) compute entropy
-        ent_loss = -(probs * torch.log(probs)).sum(-1).mean()
+        # — Stable entropy penalty (no nan_to_num) —
+        # 1) get log-probs via log_softmax for numeric stability
+        log_probs = F.log_softmax(logits, dim=-1)
+        # 2) exponentiate to get probabilities
+        probs = torch.exp(log_probs)
+        # 3) clamp to [ε, 1−ε] to avoid log(0) or division issues
+        eps = 1e-5
+        probs = probs.clamp(min=eps, max=1.0 - eps)
+        # 4) recompute log(probs) on the clamped values
+        log_probs = torch.log(probs)
+        # 5) compute entropy
+        ent_loss = -(probs * log_probs).sum(-1).mean()
         primary = primary - 1e-4 * ent_loss
 
         # Manual autograd.grad hack removed – resonant-token penalties
