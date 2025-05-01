@@ -811,6 +811,18 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     model.scaler.step(opt)
     model.scaler.update()
 
+    # ——— sanitize every parameter so no NaNs/Infs can persist ———
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                # replace NaN→0, +Inf→+1e4, –Inf→–1e4
+                clean = torch.nan_to_num(p, nan=0.0, posinf=1e4, neginf=-1e4)
+                # if anything changed, log it once
+                if torch.any(clean != p):
+                    print(f"[PARAM CLEANUP] {name} had invalids, repaired")
+                p.copy_(clean)
+
+
     if batch_idx % 10 == 0:
         log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, 
                     ctx, epoch, batch_idx, loader_len, config, skip_counts, 
