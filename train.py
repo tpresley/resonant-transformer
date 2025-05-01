@@ -338,8 +338,18 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             del attn_records[:]
 
         if logits.size(1) >= 2:
-            pr = lp.exp().clamp(min=1e-5, max=1-1e-5)
-            ent = -(pr * pr.log()).sum(-1)
+            # — Stable entropy for resolution penalty (no clamp) —
+            # re-use lp = F.log_softmax(logits, dim=-1) from above
+            probs = lp.exp()             # [B, L, V] probabilities
+            eps   = 1e-5
+            mask  = probs > eps          # avoid zero→-inf
+            # only accumulate p*log(p) where p > eps
+            ent_terms = torch.where(
+                mask, 
+                probs * lp, 
+                torch.zeros_like(probs)
+            )                            # [B, L, V]
+            ent = -ent_terms.sum(-1)     # [B, L] (stable, no nan)
             pen, pos = ent[:, -2], ent[:, -1]
             rr = F.relu(pen - pos).mean()
             rr = torch.clamp(rr, max=0.5)
