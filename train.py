@@ -798,6 +798,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             compute_losses(model, logits, tgt, inp, ctx, res,
                            config, device, epoch, batch_idx,
                            skip_counts, attn_records,
+                           sur_baseline, res_baseline,
                            hidden_contrastive_loss, flux_penalty)
 
     # --- AMP step for the global optimizer ---
