@@ -3,6 +3,8 @@
 # === 0. Imports ===
 import os
 import time
+import random
+import math
 import torch
 import wandb
 import torch.nn.functional as F
@@ -36,7 +38,8 @@ def prepare_environment():
         baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
         resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
         sequence_length, max_tokens, learning_rate, batch_size, num_epochs, 
-        lr_warmup_epochs, embedding_dropout, label_smoothing, warmup_epochs,
+        lr_warmup_epochs, embedding_dropout, label_smoothing, validation_split, 
+        early_stopping_patience, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive
@@ -54,7 +57,8 @@ def prepare_environment():
         "baseline": baseline, "d_model": d_model, "num_heads": num_heads, "num_layers": num_layers,
         "vocab_size": vocab_size, "weight_decay": weight_decay, "resonant_token_count": resonant_token_count,
         "dynamic_resonant_token_count": dynamic_resonant_token_count, "token_learning_amplifier": token_learning_amplifier,
-        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate, "embedding_dropout": embedding_dropout,
+        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate, 
+        "embedding_dropout": embedding_dropout, "validation_split": validation_split, "early_stopping_patience": early_stopping_patience,
         "batch_size": batch_size, "num_epochs": num_epochs, "lr_warmup_epochs": lr_warmup_epochs, 
         "label_smoothing": label_smoothing, "warmup_epochs": warmup_epochs,
         "lambda_ri": lambda_ri, "lambda_rs": lambda_rs, "lambda_div": lambda_div,
@@ -497,7 +501,7 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
 
 
 # === 11. Training Loop ===
-def train(model, loader, opt, scheduler, config, device, tokenizer):
+def train(model, train_loader, val_loader, opt, scheduler, config, device, tokenizer):
     print("Start Training")
     model.tokenizer = tokenizer
     last_res = None
@@ -509,9 +513,11 @@ def train(model, loader, opt, scheduler, config, device, tokenizer):
     current_recursive_target_steps = 2 if not config["baseline"] else 1
     fade_in_progress = 0.0
 
+    best_val_ppl = float("inf")
+    no_improve_epochs = 0
     for epoch in range(config["num_epochs"]):
         last_res, sur_baseline, res_baseline, current_recursive_target_steps, fade_in_progress = train_epoch(
-            model, loader, opt, scheduler, config, device, epoch,
+            model, train_loader, opt, scheduler, config, device, epoch,
             last_res, sur_baseline, res_baseline,
             current_recursive_target_steps=current_recursive_target_steps,
             fade_in_progress=fade_in_progress,
@@ -520,6 +526,47 @@ def train(model, loader, opt, scheduler, config, device, tokenizer):
             attn_records=attn_records,
             tokenizer=tokenizer
         )
+        # — every epoch, evaluate on val set —
+        model.eval()
+        total_ce = 0.0
+        total_tokens = 0
+        with torch.no_grad(), autocast(enabled=(device.type=="cuda")):
+            val_last_res = None
+            for batch, lengths in val_loader:
+                inp = batch[:, :-1].to(device)
+                tgt = batch[:, 1:].to(device)
+                ctx = val_last_res if val_last_res is not None else inp
+                mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
+                if config["baseline"]:
+                    logits = model.forward(inp, context=ctx, padding_mask=mask)[0]
+                else:
+                    logits, _, _, _ = model.recursive_forward(
+                        inp, ctx,
+                        tol=config["recursive_convergence_tolerance"],
+                        padding_mask=mask,
+                        fade_in_strength=1.0
+                    )
+                    val_last_res = model._res_tokens_for_ri
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                flat_tgt    = tgt.reshape(-1)
+                nonpad      = (flat_tgt != tokenizer.token_to_id("<pad>"))
+                ce_loss     = F.cross_entropy(flat_logits, flat_tgt, reduction="none")
+                total_ce   += (ce_loss * nonpad).sum().item()
+                total_tokens += nonpad.sum().item()
+        val_ppl = math.exp(total_ce / total_tokens)
+        wandb.log({"val_perplexity": val_ppl}, step=epoch)
+        print(f"Epoch {epoch+1}: validation perplexity = {val_ppl:.2f}")
+        if val_ppl < best_val_ppl:
+            best_val_ppl = val_ppl
+            no_improve_epochs = 0
+            save_checkpoint(model, opt, config, epoch,
+                            filename_prefix="best-val-checkpoint-epoch")
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= config["early_stopping_patience"]:
+                print(f"No improvement for {config['early_stopping_patience']} epochs; stopping early.")
+                break
+        model.train()
         if (epoch + 1) % 10 == 0:
             save_checkpoint(model, opt, config, epoch)
     save_final_model(model, config, last_res)
@@ -659,7 +706,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         res.retain_grad()
 
     if batch_idx % 10 == 0:
-        global_step = epoch * len(loader) + batch_idx
+        global_step = epoch * len(train_loader) + batch_idx
         wandb.log({
             'fade_in_strength': fade_in_strength,
         }, step=global_step)
@@ -863,10 +910,24 @@ if __name__ == "__main__":
     DEVICE, config = prepare_environment()
     corpus_path    = prepare_dataset()
     tokenizer      = setup_tokenizer(corpus_path, vocab_size=config["vocab_size"])
-    all_sequences  = encode_corpus(corpus_path, tokenizer, sequence_length=config["sequence_length"], max_tokens=config["max_tokens"])
-    loader         = create_dataloader(all_sequences, tokenizer, batch_size=config["batch_size"])
-    
+    all_sequences = encode_corpus(corpus_path, tokenizer,
+                                  sequence_length=config["sequence_length"],
+                                  max_tokens=config["max_tokens"])
+    # — split out a validation set —
+    random.shuffle(all_sequences)
+    val_size = int(len(all_sequences) * config["validation_split"])
+    val_seqs = all_sequences[:val_size]
+    train_seqs = all_sequences[val_size:]
+
+    train_loader = create_dataloader(train_seqs, tokenizer,
+                                     batch_size=config["batch_size"])
+    val_loader   = create_dataloader(val_seqs, tokenizer,
+                                     batch_size=config["batch_size"])
+
     model, scaler, attn_records = build_model(config, tokenizer, DEVICE)
-    opt, scheduler              = setup_optimizer_and_scheduler(model, config, dataset_size=len(all_sequences), device_type=DEVICE.type)
-    
-    train(model, loader, opt, scheduler, config, DEVICE, tokenizer)
+    opt, scheduler = setup_optimizer_and_scheduler(
+        model, config, dataset_size=len(train_seqs), device_type=DEVICE.type
+    )
+
+    train(model, train_loader, val_loader, opt, scheduler,
+          config, DEVICE, tokenizer)

@@ -22,6 +22,10 @@ num_epochs = 50
 lr_warmup_epochs = max(1, int(0.05 * num_epochs))
 label_smoothing = 0.1
 embedding_dropout = 0.1
+# Fraction of data to reserve for validation
+validation_split = 0.1
+# Number of epochs with no val-PPL improvement before early stopping
+early_stopping_patience = 3
 
 #####
 # Resonant Token Parameters
