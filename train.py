@@ -367,10 +367,18 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         )
         con = config["lambda_contrastive"] * raw_con
 
-        lp_ent = F.log_softmax(logits, dim=-1)
-        pr_ent = lp_ent.exp().clamp(min=1e-5, max=1-1e-5)
-        lp_ent = torch.log(pr_ent)
-        ent_loss = -(pr_ent * lp_ent).sum(-1).mean()
+        # — Stable entropy penalty —
+        # 1) get probabilities
+        probs = torch.softmax(logits, dim=-1)
+        # 2) clamp to avoid exact 0 or 1
+        probs = probs.clamp(min=1e-5, max=1-1e-5)
+        # 3) replace any NaNs/Infs that snuck through
+        probs = torch.nan_to_num(probs,
+                                 nan=1e-5,
+                                 posinf=1-1e-5,
+                                 neginf=1e-5)
+        # 4) compute entropy
+        ent_loss = -(probs * torch.log(probs)).sum(-1).mean()
         primary = primary - 1e-4 * ent_loss
 
         # Manual autograd.grad hack removed – resonant-token penalties
@@ -537,7 +545,9 @@ def train(model, train_loader, val_loader, opt, scheduler, config, device, token
                 tgt = batch[:, 1:].to(device)
                 ctx = val_last_res if val_last_res is not None else inp
                 mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
+                # — Compute logits exactly as in train_batch —
                 if config["baseline"]:
+                    # baseline forward returns (logits, …)
                     logits = model.forward(inp, context=ctx, padding_mask=mask)[0]
                 else:
                     logits, _, _, _ = model.recursive_forward(
@@ -547,6 +557,9 @@ def train(model, train_loader, val_loader, opt, scheduler, config, device, token
                         fade_in_strength=1.0
                     )
                     val_last_res = model._res_tokens_for_ri
+
+                # Strip off the initial self-token
+                logits = logits[:, 1 : 1 + inp.size(1), :]
                 flat_logits = logits.reshape(-1, logits.size(-1))
                 flat_tgt    = tgt.reshape(-1)
                 nonpad      = (flat_tgt != tokenizer.token_to_id("<pad>"))
