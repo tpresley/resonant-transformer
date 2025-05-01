@@ -578,7 +578,6 @@ def train(model, train_loader, val_loader, opt, scheduler, config, device, token
                 total_ce   += (ce_loss * nonpad).sum().item()
                 total_tokens += nonpad.sum().item()
         val_ppl = math.exp(total_ce / total_tokens)
-        wandb.log({"val_perplexity": val_ppl}, step=epoch)
         print(f"Epoch {epoch+1}: validation perplexity = {val_ppl:.2f}")
         if val_ppl < best_val_ppl:
             best_val_ppl = val_ppl
@@ -792,11 +791,14 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     ce_loss  = (ce_per_t * mask).sum() / (mask.sum() + 1e-12)
     ppl = float(torch.exp(ce_loss))
 
-    primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline = compute_losses(
-        model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
-        skip_counts, attn_records, sur_baseline, res_baseline,
-        hidden_contrastive_loss, flux_penalty
-    )
+    # switch back to FP32 and compute losses safely
+    logits = logits.float()
+    with autocast(device_type=device.type, enabled=False):
+        primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline = \
+            compute_losses(model, logits, tgt, inp, ctx, res,
+                           config, device, epoch, batch_idx,
+                           skip_counts, attn_records,
+                           hidden_contrastive_loss, flux_penalty)
 
     # --- AMP step for the global optimizer ---
     opt.zero_grad()
