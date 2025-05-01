@@ -35,7 +35,8 @@ def prepare_environment():
     from config import (
         baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
         resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
-        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, lr_warmup_epochs, warmup_epochs,
+        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, 
+        lr_warmup_epochs, label_smoothing, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive
@@ -54,7 +55,8 @@ def prepare_environment():
         "vocab_size": vocab_size, "weight_decay": weight_decay, "resonant_token_count": resonant_token_count,
         "dynamic_resonant_token_count": dynamic_resonant_token_count, "token_learning_amplifier": token_learning_amplifier,
         "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate,
-        "batch_size": batch_size, "num_epochs": num_epochs, "warmup_epochs": warmup_epochs,
+        "batch_size": batch_size, "num_epochs": num_epochs, "lr_warmup_epochs": lr_warmup_epochs, 
+        "label_smoothing": label_smoothing, "warmup_epochs": warmup_epochs,
         "lambda_ri": lambda_ri, "lambda_rs": lambda_rs, "lambda_div": lambda_div,
         "lambda_sur": lambda_sur, "lambda_attn": lambda_attn, "lambda_res": lambda_res,
         "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
@@ -257,7 +259,13 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
     pad_id = model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else -100
     logits_flat = logits.reshape(-1, logits.size(-1))
     tgt_flat    = tgt.reshape(-1)
-    ce_per_tok  = F.cross_entropy(logits_flat, tgt_flat, reduction='none')
+    # --- Apply label smoothing to discourage over-confident spikes ---
+    ce_per_tok  = F.cross_entropy(
+        logits_flat,
+        tgt_flat,
+        reduction='none',
+        label_smoothing=config.get("label_smoothing", 0.0)
+    )
     nonpad_mask = (tgt_flat != pad_id).float()
     primary     = (ce_per_tok * nonpad_mask).sum() / (nonpad_mask.sum() + 1e-12)
 
