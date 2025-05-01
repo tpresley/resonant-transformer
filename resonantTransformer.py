@@ -548,10 +548,17 @@ class EnhancedResonantTransformer(nn.Module):
         if entropy_deltas and attention_kls:
             recursive_flux = torch.stack(entropy_deltas).mean() + torch.stack(attention_kls).mean()
             modulation_signal = compute_modulation_signal(recursive_flux)
+            # guard against NaNs/Infs from FP16
+            modulation_signal = torch.nan_to_num(
+                modulation_signal,
+                nan=0.0,        # replace NaN with 0 (no modulation)
+                posinf=1.0,     # if +Inf, treat as full modulation
+                neginf=0.0      # if –Inf, treat as zero modulation
+            ).clamp(0.0, 1.0)
 
             for module in self.modules():
                 if isinstance(module, LawfulLinear):
-                    module.raf_modulation = modulation_signal.item()
+                    module.raf_modulation = float(modulation_signal.item())
 
         # === Global resonant token update ===
         if res is not None and res.numel() > 0:
