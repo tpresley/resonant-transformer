@@ -35,7 +35,7 @@ def prepare_environment():
     from config import (
         baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
         resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
-        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, warmup_epochs,
+        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, lr_warmup_epochs, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive
@@ -225,12 +225,24 @@ def setup_optimizer_and_scheduler(model, config, dataset_size, device_type="cuda
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped)
 
-    steps_per_epoch = dataset_size // batch_size
+    # total and warmup steps
+    steps_per_epoch      = dataset_size // batch_size
     total_training_steps = steps_per_epoch * num_epochs
+    warmup_steps         = int(config["lr_warmup_epochs"] * steps_per_epoch)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_training_steps, eta_min=1e-5
-    )
+    # build a single LR‐lambda: linear ramp for warmup, then cosine decay
+    import math
+    from torch.optim.lr_scheduler import LambdaLR
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # linear ramp: 0 → 1
+            return float(current_step) / float(max(1, warmup_steps))
+        # cosine anneal from 1 → 0 over the remaining steps
+        progress = float(current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     return optimizer, scheduler
 
