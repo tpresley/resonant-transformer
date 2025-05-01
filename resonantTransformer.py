@@ -384,10 +384,10 @@ class EnhancedResonantTransformer(nn.Module):
             feedback_strength = 1.0
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
-            logits = repair_if_invalid(logits, name="logits", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
-            res = repair_if_invalid(res, name="resonant output", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
-            hidden = repair_if_invalid(hidden, name="hidden state", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
-            context = repair_if_invalid(context, name="context vector", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            # logits = repair_if_invalid(logits, name="logits", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            # res = repair_if_invalid(res, name="resonant output", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            # hidden = repair_if_invalid(hidden, name="hidden state", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
+            # context = repair_if_invalid(context, name="context vector", counter=self.repair_counter if hasattr(self, 'repair_counter') else None)
 
             # === Inject low-rank structured noise into context ===
             if self.training and context is not None:
