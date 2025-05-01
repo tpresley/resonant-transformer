@@ -617,6 +617,10 @@ class LawfulLinear(nn.Module):
 
         self.raf_modulation = 1.0  # Default modulation factor
 
+        self.device = torch.device("mps") if torch.backends.mps.is_available() else (
+             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -628,7 +632,7 @@ class LawfulLinear(nn.Module):
 
     def forward(self, x):
         # disable AMP here so we never combine weights in FP16
-        with autocast(enabled=False):
+        with autocast(device_type=self.device, enabled=False):
             weight = self.weight_base + self.delta_weight * self.raf_modulation
             bias   = (self.bias_base + self.delta_bias * self.raf_modulation
                       if self.bias_base is not None else None)
