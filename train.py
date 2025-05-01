@@ -380,7 +380,7 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
                                 torch.zeros_like(probs))
         # 4) sum over vocab and average
         ent_loss = -ent_terms.sum(-1).mean()
-        primary = primary - 1e-4 * ent_loss
+        primary = primary - 1e-4 * ent_loss.detach()
 
         # Manual autograd.grad hack removed – resonant-token penalties
         # will now flow via the inner-loop/backward pass.
