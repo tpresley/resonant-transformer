@@ -652,9 +652,7 @@ def train_epoch(model, loader, opt, scheduler, config, device, epoch, last_res, 
 
             # Clamp resonant tokens cleanly after enabling
             if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                with torch.no_grad():
-                    model._res_tokens_for_ri.clamp_(-1.0, 1.0)
-                    model._res_tokens_for_ri.requires_grad_(True)
+                model._res_tokens_for_ri = model._res_tokens_for_ri.clamp(-1.0, 1.0)
 
     for batch_idx, (batch, lengths) in enumerate(loader):
         last_res, sur_baseline, res_baseline, fade_in_progress, current_recursive_target_steps = train_batch(
@@ -776,7 +774,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             # Clamp large values
             if res.abs().max() > 10.0:
                 print("[stabilize] Large values detected in recursive output. Clamping to [-10,10].")
-                res.clamp_(min=-10.0, max=10.0)
+                res = res.clamp(min=-10.0, max=10.0)
 
     # strip off resonant tokens
     logits = logits[:, 1:1 + inp.size(1)]
@@ -890,9 +888,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
 
                 # Clamp resonant tokens
                 if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
-                    with torch.no_grad():
-                        model._res_tokens_for_ri.clamp_(-5.0, 5.0)
-                        model._res_tokens_for_ri.requires_grad_(True)
+                    model._res_tokens_for_ri = model._res_tokens_for_ri.clamp(-5.0, 5.0)
 
         # Restore parameter requires_grad
         for p in model.parameters():

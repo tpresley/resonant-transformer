@@ -626,9 +626,19 @@ class LawfulLinear(nn.Module):
             nn.init.uniform_(self.bias_base, -bound, bound)
 
     def forward(self, x):
-        weight = self.weight_base + self.delta_weight * self.raf_modulation
-        bias = self.bias_base + self.delta_bias * self.raf_modulation if self.bias_base is not None else None
-        return nn.functional.linear(x, weight, bias)
+        # sanitize your learned tensors right before use:
+        wb = torch.nan_to_num(self.weight_base, nan=0.0,  posinf=1e4, neginf=-1e4)
+        dw = torch.nan_to_num(self.delta_weight, nan=0.0, posinf=1e4, neginf=-1e4)
+        weight = wb + dw * self.raf_modulation
+
+        if self.bias_base is not None:
+            bb = torch.nan_to_num(self.bias_base,  nan=0.0, posinf=1e4, neginf=-1e4)
+            db = torch.nan_to_num(self.delta_bias,  nan=0.0, posinf=1e4, neginf=-1e4)
+            bias = bb + db * self.raf_modulation
+        else:
+            bias = None
+
+        return F.linear(x, weight, bias)
 
 
 
