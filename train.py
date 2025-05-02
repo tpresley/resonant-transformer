@@ -774,16 +774,20 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     #             radius=1.0
     #         )
     #         model._res_tokens_for_ri.data.copy_(new_proj)
-        # Repair any NaNs (kept in-graph)
-        mask = torch.isnan(model._res_tokens_for_ri)
-        if mask.any():
-            print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
-            model._res_tokens_for_ri = torch.nan_to_num(
-                model._res_tokens_for_ri, nan=0.0, posinf=1.0, neginf=-1.0
+        with torch.no_grad():
+            mask = torch.isnan(model._res_tokens_for_ri)
+            if mask.any():
+                print("[repair] NaNs detected in resonant tokens after forward pass. Replacing...")
+                model._res_tokens_for_ri = torch.nan_to_num(
+                    model._res_tokens_for_ri, nan=0.0, posinf=1.0, neginf=-1.0
+                )
+
+        # Apply soft projection only if norm deviates significantly
+        norms = model._res_tokens_for_ri.norm(dim=-1)
+        if (norms > 1.5).any() or (norms < 0.5).any():
+            model._res_tokens_for_ri = soft_project_onto_hypersphere(
+                model._res_tokens_for_ri, target_radius=1.0, tolerance=0.25, strength=0.2
             )
-        # Differentiable projection onto unit sphere (preserve gradient path)
-        norm = model._res_tokens_for_ri.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        model._res_tokens_for_ri = model._res_tokens_for_ri / norm
 
     if res is not None:
         with torch.no_grad():
