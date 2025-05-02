@@ -37,6 +37,7 @@ early_stopping_patience = 3
 
 multihead_resonance = True  # boolean flag for multihead resonance
 warmup_epochs = 3  # controls ramp of influence of all resonant features
+max_fade_in_strength = 0.3  # caps influence during warmup
 max_recursive_steps = 5
 
 resonant_token_count = 6   # Number of Static Resonant Tokens (zero to disable)

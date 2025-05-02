@@ -778,7 +778,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             # ramp this stage from 0→1 over one warmup block
             frac = (Pp - (stage - 1) * W) / W
             raw_strength = float(min(max(frac, 0.0), 1.0))
-            fade_in_strength = min(raw_strength, 0.5)  # Cap influence to 50%
+            fade_in_strength = min(raw_strength, config.get("max_fade_in_strength", 0.3))  # Cap influence to 50%
 
 
     if config["baseline"]:
