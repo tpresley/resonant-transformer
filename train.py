@@ -772,7 +772,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
             Pp = P - W
             # which extra-step block we’re in
             max_stage = max(0, final_steps - init_steps)
-            stage = min(int(Pp // W) + 1, max_stage)
+            stage = min(int(Pp // W) + 1, max_stage) if W != 0 else 1
             # update total rec steps
             model.max_recursive_steps = init_steps + stage
             # ramp this stage from 0→1 over one warmup block
