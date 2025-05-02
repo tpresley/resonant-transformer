@@ -692,7 +692,9 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         inp_emb = model.embedding_dropout(inp_emb)
         real_ctx_vec = inp_emb.mean(dim=1)                  # [B, D]
 
-        mem_ctx_vec = last_res.detach().mean(dim=1)         # [B, D]
+        # apply stochastic dropout to resonant tokens before pooling
+        noisy_res  = F.dropout(last_res.detach(), p=0.1, training=model.training)
+        mem_ctx_vec = noisy_res.mean(dim=1)                 # [B, D]
 
         # blend via the model’s learnable gate
         gate = torch.sigmoid(model.memory_gate)
