@@ -118,12 +118,13 @@ class CustomTransformerEncoderLayer(nn.Module):
         if src_mask is not None:
             attn_scores += src_mask.unsqueeze(1)
         if src_key_padding_mask is not None:
-            # mask out padding positions with a large finite negative, not -inf
+            # mask out padding positions with the dtype-specific minimum (fits float16)
+            neg_val = torch.finfo(attn_scores.dtype).min
             attn_scores = attn_scores.masked_fill(
                 src_key_padding_mask.unsqueeze(1).unsqueeze(2),
-                -1e9
+                neg_val
             )
-            # clamp extreme values to keep softmax numerically stable
+            # then clamp into a finite window for stable softmax
             attn_scores = attn_scores.clamp(min=-30.0, max=30.0)
 
         attn_weights = torch.softmax(attn_scores, dim=-1)
