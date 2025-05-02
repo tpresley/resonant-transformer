@@ -43,7 +43,7 @@ def prepare_environment():
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive,
-        lambda_dyn_var, lambda_head_entropy, lambda_inner_align
+        lambda_dyn_var, lambda_head_entropy, lambda_inner_align, lambda_entropy
     )
     if baseline:
         resonant_token_count = 0
@@ -68,7 +68,8 @@ def prepare_environment():
         "recursive_convergence_tolerance": recursive_convergence_tolerance,
         "flux_penalty_weight": flux_penalty_weight, "contrastive_margin": contrastive_margin,
         "lambda_contrastive": lambda_contrastive, "lambda_dyn_var": lambda_dyn_var, 
-        "lambda_head_entropy": lambda_head_entropy, "lambda_inner_align": lambda_inner_align
+        "lambda_head_entropy": lambda_head_entropy, "lambda_inner_align": lambda_inner_align,
+        "lambda_entropy": lambda_entropy
     }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
@@ -403,7 +404,9 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
                                 torch.zeros_like(probs))
         # 4) sum over vocab and average
         ent_loss = -ent_terms.sum(-1).mean()
-        primary = primary - 1e-4 * ent_loss.detach()
+        # === NEW: Entropy regularization (encourage diversity) ===
+        lambda_entropy = config.get("lambda_entropy", 1e-4)
+        primary = primary - lambda_entropy * ent_loss  # keep in-graph to allow gradients
 
         # Manual autograd.grad hack removed – resonant-token penalties
         # will now flow via the inner-loop/backward pass.

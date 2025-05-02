@@ -68,3 +68,4 @@ lambda_contrastive   = 5.0     # Heavily weight contrastive loss in the total
 lambda_dyn_var = 0.05
 lambda_head_entropy = 0.01
 lambda_inner_align = 1.0
+lambda_entropy = 2e-4
