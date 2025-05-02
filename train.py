@@ -34,17 +34,17 @@ def hard_project_onto_hypersphere(x, radius=1.0, eps=1e-8):
 
 # === 2. Environment & Config Setup ===
 def prepare_environment():
-    from config import (
-        baseline, wandb_project_name, d_model, num_heads, num_layers, vocab_size, weight_decay,
-        resonant_token_count, dynamic_resonant_token_count, token_learning_amplifier,
-        sequence_length, max_tokens, learning_rate, batch_size, num_epochs, 
-        lr_warmup_epochs, embedding_dropout, label_smoothing, validation_split, 
-        early_stopping_patience, warmup_epochs,
-        lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
-        multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
-        flux_penalty_weight, contrastive_margin, lambda_contrastive,
-        lambda_dyn_var, lambda_head_entropy, lambda_inner_align, lambda_entropy
-    )
+    from config import get_config
+    config_dict = get_config()
+
+    baseline = config_dict.get("baseline", False)
+    max_tokens = config_dict.get("max_tokens", 0)
+    d_model = config_dict.get("d_model", 0)
+    num_heads = config_dict.get("num_heads", 0)
+    num_layers = config_dict.get("num_layers", 0)
+    sequence_length = config_dict.get("sequence_length", 0)
+    wandb_project_name = config_dict.get("wandb_project_name", None)
+
     if baseline:
         resonant_token_count = 0
         dynamic_resonant_token_count = 0
@@ -54,23 +54,6 @@ def prepare_environment():
     token_part = "BASE" if baseline else f"{resonant_token_count}-{dynamic_resonant_token_count}"
     millions = int(max_tokens / 1_000_000)
     run_name = f"{token_part}-{d_model}-{num_heads}-{num_layers}-{sequence_length}-{millions}M"
-    config_dict = {
-        "baseline": baseline, "d_model": d_model, "num_heads": num_heads, "num_layers": num_layers,
-        "vocab_size": vocab_size, "weight_decay": weight_decay, "resonant_token_count": resonant_token_count,
-        "dynamic_resonant_token_count": dynamic_resonant_token_count, "token_learning_amplifier": token_learning_amplifier,
-        "sequence_length": sequence_length, "max_tokens": max_tokens, "learning_rate": learning_rate, 
-        "embedding_dropout": embedding_dropout, "validation_split": validation_split, "early_stopping_patience": early_stopping_patience,
-        "batch_size": batch_size, "num_epochs": num_epochs, "lr_warmup_epochs": lr_warmup_epochs, 
-        "label_smoothing": label_smoothing, "warmup_epochs": warmup_epochs,
-        "lambda_ri": lambda_ri, "lambda_rs": lambda_rs, "lambda_div": lambda_div,
-        "lambda_sur": lambda_sur, "lambda_attn": lambda_attn, "lambda_res": lambda_res,
-        "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
-        "recursive_convergence_tolerance": recursive_convergence_tolerance,
-        "flux_penalty_weight": flux_penalty_weight, "contrastive_margin": contrastive_margin,
-        "lambda_contrastive": lambda_contrastive, "lambda_dyn_var": lambda_dyn_var, 
-        "lambda_head_entropy": lambda_head_entropy, "lambda_inner_align": lambda_inner_align,
-        "lambda_entropy": lambda_entropy
-    }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
 
