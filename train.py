@@ -43,7 +43,7 @@ def prepare_environment():
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
         flux_penalty_weight, contrastive_margin, lambda_contrastive,
-        lambda_dyn_var, lambda_head_entropy
+        lambda_dyn_var, lambda_head_entropy, lambda_inner_align
     )
     if baseline:
         resonant_token_count = 0
@@ -67,7 +67,8 @@ def prepare_environment():
         "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
         "recursive_convergence_tolerance": recursive_convergence_tolerance,
         "flux_penalty_weight": flux_penalty_weight, "contrastive_margin": contrastive_margin,
-        "lambda_contrastive": lambda_contrastive, "lambda_dyn_var": lambda_dyn_var, "lambda_head_entropy": lambda_head_entropy
+        "lambda_contrastive": lambda_contrastive, "lambda_dyn_var": lambda_dyn_var, 
+        "lambda_head_entropy": lambda_head_entropy, "lambda_inner_align": lambda_inner_align
     }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
@@ -733,7 +734,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         mem_ctx_vec = noisy_res.mean(dim=1)                 # [B, D]
 
         # blend via the model’s learnable gate
-        gate = torch.sigmoid(model.memory_gate)
+        gate = model.memory_gate_layer(real_ctx_vec)  # [B, D]
         ctx = gate * mem_ctx_vec + (1 - gate) * real_ctx_vec  # [B, D]
 
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
@@ -910,7 +911,7 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         print(f"[SAMPLE @ {global_step}]:", sample[:200])
 
     # === Every 100 batches: extra inner loop for resonant tokens ===
-    if batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
+    if epoch >= config.get("warmup_epochs", 5) and batch_idx % 100 == 0 and (config["resonant_token_count"] + config["dynamic_resonant_token_count"]) > 0:
         print("[inner-loop] Resonant token refinement...")
 
         # Freeze everything
@@ -961,6 +962,12 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
                         config["lambda_rs"] * rs_v_inner.mean() +
                         (1.5 * config["lambda_div"]) * dvt_inner
                     )
+
+                    # === NEW: Similarity penalty between outer and inner resonant states ===
+                    if res is not None and res_inner is not None and res.shape == res_inner.shape:
+                        alignment_loss = F.mse_loss(res_inner, res.detach())
+                        sim_weight = config.get("lambda_inner_align", 1.0)
+                        token_loss += sim_weight * alignment_loss
 
                 # AMP step for the inner‐loop optimizer
                 temp_opt.zero_grad()
