@@ -37,13 +37,16 @@ def prepare_environment():
     from config import get_config
     config_dict = get_config()
 
+    wandb_project_name = config_dict.get("wandb_project_name", "no-name-configured")
+
     baseline = config_dict.get("baseline", False)
     max_tokens = config_dict.get("max_tokens", 0)
     d_model = config_dict.get("d_model", 0)
     num_heads = config_dict.get("num_heads", 0)
     num_layers = config_dict.get("num_layers", 0)
     sequence_length = config_dict.get("sequence_length", 0)
-    wandb_project_name = config_dict.get("wandb_project_name", None)
+    resonant_token_count = config_dict.get("resonant_token_count", 0)
+    dynamic_resonant_token_count = config_dict.get("dynamic_resonant_token_count", 0)
 
     if baseline:
         resonant_token_count = 0
