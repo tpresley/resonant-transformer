@@ -64,3 +64,6 @@ flux_penalty_weight = 0.01
 #####
 contrastive_margin   = 50.0    # Blow up the margin so dist rarely exceeds it
 lambda_contrastive   = 5.0     # Heavily weight contrastive loss in the total
+
+lambda_dyn_var = 0.05
+lambda_head_entropy = 0.01

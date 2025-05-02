@@ -42,7 +42,8 @@ def prepare_environment():
         early_stopping_patience, warmup_epochs,
         lambda_ri, lambda_rs, lambda_div, lambda_sur, lambda_attn, lambda_res,
         multihead_resonance, max_recursive_steps, recursive_convergence_tolerance,
-        flux_penalty_weight, contrastive_margin, lambda_contrastive
+        flux_penalty_weight, contrastive_margin, lambda_contrastive,
+        lambda_dyn_var, lambda_head_entropy
     )
     if baseline:
         resonant_token_count = 0
@@ -66,7 +67,7 @@ def prepare_environment():
         "multihead_resonance": multihead_resonance, "max_recursive_steps": max_recursive_steps,
         "recursive_convergence_tolerance": recursive_convergence_tolerance,
         "flux_penalty_weight": flux_penalty_weight, "contrastive_margin": contrastive_margin,
-        "lambda_contrastive": lambda_contrastive
+        "lambda_contrastive": lambda_contrastive, "lambda_dyn_var": lambda_dyn_var, "lambda_head_entropy": lambda_head_entropy
     }
     wandb.init(project=wandb_project_name, name=run_name, config=config_dict)
     return DEVICE, config_dict
@@ -410,6 +411,29 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         primary = primary + 0.05 * hidden_contrastive_loss
         lambda_flux = ramp_weight(epoch, config["flux_penalty_weight"], config["warmup_epochs"])
         primary = primary + lambda_flux * flux_penalty
+
+        # Optional direct regularizers for controller & resonator
+        dyn_var_penalty = torch.tensor(0.0, device=device)
+        head_entropy_penalty = torch.tensor(0.0, device=device)
+
+        if hasattr(model, 'dynamic_tokens_latest') and model.dynamic_tokens_latest is not None:
+            dt = model.dynamic_tokens_latest  # shape: [B, T, D]
+            if dt.numel() > 0:
+                mean = dt.mean(dim=0, keepdim=True)
+                var = ((dt - mean) ** 2).mean()
+                dyn_var_penalty = -var  # penalize low variance (maximize var)
+        if hasattr(model, 'controller') and hasattr(model.controller, 'linear'):
+            # Entropy of selector distribution from MultiHeadResonance
+            if hasattr(model, 'resonator') and hasattr(model.resonator, 'selector'):
+                context_vec = ctx.mean(dim=1) if ctx.dim() == 3 else ctx  # [B, D]
+                logits = model.resonator.selector(context_vec)  # [B, H]
+                probs = torch.softmax(logits, dim=-1)
+                entropy = -(probs * probs.log()).sum(dim=-1).mean()
+                head_entropy_penalty = -entropy  # maximize entropy => penalize low entropy
+        lambda_dyn_var = config.get("lambda_dyn_var", 0.05)
+        lambda_head_entropy = config.get("lambda_head_entropy", 0.01)
+        primary = primary + lambda_dyn_var * dyn_var_penalty
+        primary = primary + lambda_head_entropy * head_entropy_penalty
 
     return primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline
 
