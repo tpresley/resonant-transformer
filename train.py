@@ -519,6 +519,14 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
             if bank.grad is not None:
                 mh_grad_norm = bank.grad.norm().item()
 
+    # === NEW: Log top-1 softmax probability ===
+    if hasattr(model, 'latest_logits'):
+        probs = torch.softmax(model.latest_logits, dim=-1)
+        top1_probs = probs.max(dim=-1).values  # [B, L]
+        avg_top1_prob = top1_probs.mean().item()
+    else:
+        avg_top1_prob = 0.0  # default if unavailable
+
 
     wandb.log({
         'loss': primary.item(),
@@ -529,6 +537,7 @@ def log_metrics(model, ppl, primary, con, dvt, sur_reward, akl, res_reward, ctx,
         'resolution_score': res_reward.item() if res_reward is not None else 0.0,
         'res_token_norm': res_token_norm,
         'static_res_norm': stat_norm,
+        'top1_logit_prob': avg_top1_prob,
 
         # controller (dynamic) parameter norms & grads
         'dyn_controller_weight_norm': dyn_weight_norm,
