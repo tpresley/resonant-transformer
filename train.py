@@ -816,6 +816,8 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
         print("[logits_stabilize] Warning: clamping logits to [-10, 10].")
         logits = torch.clamp(logits, min=-10.0, max=10.0)
 
+    model.latest_logits = logits.detach()
+
     # === Immediately after forward pass, repair resonant tokens ===
     if hasattr(model, '_res_tokens_for_ri') and model._res_tokens_for_ri is not None:
     #     with torch.no_grad():
