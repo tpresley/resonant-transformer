@@ -687,8 +687,17 @@ def train_batch(model, batch, lengths, opt, scheduler, config, device, epoch, ba
     if last_res is None:
         ctx = inp
     else:
+        # a) “real” context from the current batch of input tokens
+        inp_emb = model.embedding(inp)                     # [B, L, D]
+        inp_emb = model.embedding_dropout(inp_emb)
+        real_ctx_vec = inp_emb.mean(dim=1)                 # [B, D]
+
+        # b) “memory” context from last_res
+        # last_res is [B, R, D]; we detach so gradients don’t flow across batches
+        mem_ctx_vec  = last_res.detach().mean(dim=1)       # [B, D]
+
         alpha = min(1.0, (epoch + batch_idx/loader_len) / config["warmup_epochs"])
-        ctx = alpha * last_res.detach() + (1-alpha) * inp
+        ctx = alpha * mem_ctx_vec + (1 - alpha) * real_ctx_vec  # [B, D]
 
     padding_mask = (inp == tokenizer.token_to_id("<pad>")).to(device)
 
