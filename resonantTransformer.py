@@ -118,10 +118,13 @@ class CustomTransformerEncoderLayer(nn.Module):
         if src_mask is not None:
             attn_scores += src_mask.unsqueeze(1)
         if src_key_padding_mask is not None:
+            # mask out padding positions with a large finite negative, not -inf
             attn_scores = attn_scores.masked_fill(
                 src_key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
+                -1e9
             )
+            # clamp extreme values to keep softmax numerically stable
+            attn_scores = attn_scores.clamp(min=-30.0, max=30.0)
 
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_output = torch.matmul(self.dropout(attn_weights), v)  # [B, H, L, Dh]
@@ -305,6 +308,15 @@ class EnhancedResonantTransformer(nn.Module):
             blended_tokens = tokens
 
         inp = torch.cat([blended_tokens, emb], dim=1)
+        # ensure padding_mask spans the full sequence (resonant tokens + self-token + input)
+        if padding_mask is not None:
+            B, old_len = padding_mask.shape
+            new_len = inp.size(1)
+            pad_count = new_len - old_len
+            padding_mask = torch.cat([
+                torch.zeros(B, pad_count, dtype=padding_mask.dtype, device=padding_mask.device),
+                padding_mask
+            ], dim=1)
 
         # Normalize after blending resonant tokens and input embedding
         inp = F.layer_norm(inp, (self.d_model,))
