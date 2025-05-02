@@ -166,6 +166,8 @@ class EnhancedResonantTransformer(nn.Module):
         self.alpha = 0.0
         self.self_token = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.token_scale = nn.Parameter(torch.tensor(1.0))
+        # learnable gate for blending fresh‐input vs. resonant‐memory contexts
+        self.memory_gate = nn.Parameter(torch.zeros(1))
 
         # Optional segment embedding (2 segments: A and B)
         self.segment_embedding = nn.Embedding(2, d_model)
