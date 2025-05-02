@@ -409,6 +409,13 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
                 mean = dt.mean(dim=0, keepdim=True)
                 var = ((dt - mean) ** 2).mean()
                 dyn_var_penalty = -var  # penalize low variance (maximize var)
+        
+        # === NEW: Optional L1 penalty on token_scale sparsity ===
+        if hasattr(model, 'token_scale') and model.token_scale is not None:
+            gate = model.token_scale.clamp(0.0, 1.0)
+            l1_penalty = gate.abs().mean()
+            primary += config.get("lambda_token_sparsity", 0.01) * l1_penalty
+
         if hasattr(model, 'controller') and hasattr(model.controller, 'linear'):
             # Entropy of selector distribution from MultiHeadResonance
             if hasattr(model, 'resonator') and hasattr(model.resonator, 'selector'):

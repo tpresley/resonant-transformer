@@ -190,6 +190,7 @@ class EnhancedResonantTransformer(nn.Module):
         self.resolution_ema = torch.tensor(1.0)
         self.ema_alpha = 0.01  # You can tune this, but it's stable and general
         self.recursion_feedback_strength = 1.0
+        self.token_scale = nn.Parameter(torch.full((1, 1, d_model), 0.2))  # per-dimension scaling
 
 
         if self.dynamic_resonant_token_count > 0:
@@ -283,10 +284,11 @@ class EnhancedResonantTransformer(nn.Module):
 
         # If no resonant tokens are configured, create an empty placeholder
         if res_list:
-            safe_scale = self.token_scale.clamp(min=0.7, max=1.5)
             tokens = torch.cat(res_list, dim=1)
-            tokens = F.normalize(tokens, dim=-1) * 0.5
-            tokens = tokens * safe_scale
+            tokens = F.normalize(tokens, dim=-1) * 0.3
+            # Apply clamped, learnable per-dim scaling
+            gate = self.token_scale.clamp(0.0, 1.0)  # shape: [1, 1, D]
+            tokens = tokens * gate
 
         else:
             tokens = torch.empty(B, 0, self.d_model, device=emb.device)
