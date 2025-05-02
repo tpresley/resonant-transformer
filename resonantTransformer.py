@@ -397,6 +397,7 @@ class EnhancedResonantTransformer(nn.Module):
         hidden_steps = []  # track hidden states across steps
 
         for step in range(num_steps):
+            res_token_delta = hidden_delta = attn_delta = None
             feedback_strength = 1.0
             logits, res, attn_maps, hidden, full_out = self.forward(x, context=context, update_global=False, padding_mask=padding_mask)
 
@@ -457,15 +458,35 @@ class EnhancedResonantTransformer(nn.Module):
             if step == 0:
                 previous_res = res.detach()
                 resolution_score = torch.tensor(0.0, device=res.device)
+                self.resolution_score = resolution_score
             else:
-                resolution_score = torch.norm(res - previous_res, dim=-1).mean()
-                delta = resolution_score.item()
-                if delta < tol:
-                    print(f"Converged early at step {step}: Δres={delta:.2e} < tol={tol}")
-                    break
+                # Δresonant token change
+                res_token_delta = torch.norm(res - previous_res, dim=-1).mean()
                 previous_res = res.detach()
+
+                # Track as resolution score
+                resolution_score = res_token_delta
+                self.resolution_score = resolution_score
+
+                # Δhidden state change
+                hidden_delta = torch.norm(hidden - previous_hidden, dim=-1).mean()
+
+                # Δattention change
+                if attn_maps and previous_attention is not None:
+                    cur_attn = attn_maps[-1]
+                    prev_attn = previous_attention
+                    attn_delta = torch.norm(cur_attn - prev_attn, dim=-1).mean()
+
+                # === Composite delta ===
+                deltas = [res_token_delta, hidden_delta, attn_delta]
+                delta_vals = [d.item() for d in deltas if d is not None]
+                composite_delta = sum(delta_vals) / len(delta_vals)
+
+                if composite_delta < tol:
+                    print(f"Converged early at step {step}: Δ*={composite_delta:.2e} < tol={tol}")
+                    break
+            
             resolution_scores.append(resolution_score)
-            self.resolution_score = resolution_score
 
             eps = 1e-8  # Prevent divide-by-zero
 
