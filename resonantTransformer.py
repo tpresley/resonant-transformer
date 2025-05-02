@@ -341,11 +341,19 @@ class EnhancedResonantTransformer(nn.Module):
         # Update global_res using EMA only if flagged
         if update_global and res.numel() > 0:
             momentum = 0.9
-            batch_mean_res = res.mean(dim=0, keepdim=True)  # (1, res_tokens, d_model)
-            if self.global_res is None:
-                self.global_res = batch_mean_res.detach()
+            batch_mean_res = res.mean(dim=0, keepdim=True)  # (1, R, D)
+
+            # Collapse detection
+            if self.global_res is not None:
+                gr_norm = self.global_res.norm().item()
+                gr_std = self.global_res.std().item()
+                if gr_norm < 1e-3 or gr_std < 1e-3:
+                    print("[warn] global_res collapsed. Reinitializing from batch...")
+                    self.global_res = batch_mean_res.detach()
+                else:
+                    self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
             else:
-                self.global_res = momentum * self.global_res + (1 - momentum) * batch_mean_res.detach()
+                self.global_res = batch_mean_res.detach()
 
         return logits, res, attn_maps, hidden, out  # <--- include full transformer output
 
