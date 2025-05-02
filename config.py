@@ -4,7 +4,7 @@
 # Standard Hyperparameters
 #####
 
-baseline=True
+baseline=False
 
 wandb_project_name = "resonant-transformer-refactored"
 

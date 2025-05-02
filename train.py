@@ -426,7 +426,18 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         if hasattr(model, 'controller') and hasattr(model.controller, 'linear'):
             # Entropy of selector distribution from MultiHeadResonance
             if hasattr(model, 'resonator') and hasattr(model.resonator, 'selector'):
-                context_vec = ctx.mean(dim=1) if ctx.dim() == 3 else ctx  # [B, D]
+                if ctx.dtype in (torch.int64, torch.int32):
+                    ctx_emb = model.embedding(ctx)
+                    context_vec = ctx_emb.mean(dim=1)  # [B, D]
+                elif ctx.dim() == 3:
+                    context_vec = ctx.mean(dim=1)
+                elif ctx.dim() == 2:
+                    context_vec = ctx
+                else:
+                    raise ValueError(f"[head_entropy_penalty] Unexpected ctx shape: {ctx.shape}")
+
+                if context_vec.shape[-1] != model.d_model:
+                    raise ValueError(f"[head_entropy_penalty] context_vec shape mismatch: got {context_vec.shape}, expected [B, {model.d_model}]")
                 logits = model.resonator.selector(context_vec)  # [B, H]
                 probs = torch.softmax(logits, dim=-1)
                 entropy = -(probs * probs.log()).sum(dim=-1).mean()
