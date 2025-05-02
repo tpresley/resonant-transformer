@@ -262,6 +262,13 @@ def setup_optimizer_and_scheduler(model, config, dataset_size, device_type="cuda
 def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, batch_idx,
                    skip_counts, attn_records, sur_baseline, res_baseline,
                    hidden_contrastive_loss, flux_penalty):
+    
+    def ramp_weight(epoch, max_weight, warmup_epochs):
+        # Cosine ramp-up: 0 → max_weight over warmup_epochs
+        if epoch >= warmup_epochs:
+            return max_weight
+        return float(max_weight) * 0.5 * (1 - math.cos(math.pi * epoch / warmup_epochs))
+    
     # --- Manual masked CE: ignore tgt pads but don't let the model exploit that ---
     pad_id = model.tokenizer.token_to_id("<pad>") if hasattr(model, "tokenizer") else -100
     logits_flat = logits.reshape(-1, logits.size(-1))
@@ -310,7 +317,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             sur_baseline = 0.80 * sur_baseline + 0.20 * sur.detach()
 
         sur_reward = sur - sur_baseline
-        primary = primary - config["lambda_sur"] * sur_reward
+        lambda_sur = ramp_weight(epoch, config["lambda_sur"], config["warmup_epochs"])
+        primary = primary - lambda_sur * sur_reward
 
         if attn_records and hasattr(model, "avg_attn"):
             eps = 1e-5
@@ -329,7 +337,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             akl = F.kl_div(log_cur, avg, reduction='batchmean', log_target=False)
 
             akl = torch.clamp(akl, max=0.1)
-            primary = primary - config["lambda_attn"] * akl
+            lambda_attn = ramp_weight(epoch, config["lambda_attn"], config["warmup_epochs"])
+            primary = primary - lambda_attn * akl
 
             # Correct moving average update
             momentum = 0.90  # slightly faster
@@ -360,7 +369,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
                 res_baseline = 0.80 * res_baseline + 0.20 * rr.detach()
 
             res_reward = rr - res_baseline
-            primary = primary - config["lambda_res"] * res_reward
+            lambda_res = ramp_weight(epoch, config["lambda_res"], config["warmup_epochs"])
+            primary = primary - lambda_res * res_reward
 
         ci = inp.clone()
         ci[:, -1] = torch.randint(0, logits.size(-1), (inp.size(0),), device=device)
@@ -375,7 +385,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
             contrast_logits,
             margin=config["contrastive_margin"]
         )
-        con = config["lambda_contrastive"] * raw_con
+        lambda_contrastive = ramp_weight(epoch, config["lambda_contrastive"], config["warmup_epochs"])
+        con = lambda_contrastive * raw_con
 
         # — Stable entropy penalty via masked log-softmax (avoiding NaNs) —
         # 1) compute log-probs and probs
@@ -397,7 +408,8 @@ def compute_losses(model, logits, tgt, inp, ctx, res, config, device, epoch, bat
         primary = primary - penalty
 
         primary = primary + 0.05 * hidden_contrastive_loss
-        primary = primary + config["flux_penalty_weight"] * flux_penalty
+        lambda_flux = ramp_weight(epoch, config["flux_penalty_weight"], config["warmup_epochs"])
+        primary = primary + lambda_flux * flux_penalty
 
     return primary, con, dvt, sur_reward, akl, res_reward, sur_baseline, res_baseline
 
